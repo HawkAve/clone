@@ -33,6 +33,9 @@ import {
   fetchTrending,
   fetchTrendingDetailed,
   searchRemoteRepos,
+  fetchIssues,
+  fetchIssue,
+  fetchIssueComments,
 } from "./github.js";
 import type { TrendingRepo, TrendingOptions } from "./github.js";
 import {
@@ -75,6 +78,8 @@ import {
   printTrending,
   printRemoteRepos,
   printRemoteInfo,
+  printIssues,
+  printIssue,
   formatNumber,
   formatStars,
 } from "./format.js";
@@ -630,6 +635,91 @@ async function cmdBrowse(target: string) {
   } catch (err) {
     console.error(chalk.red(`Failed to open browser: ${(err as Error).message}`));
     console.error(`URL: ${url}`);
+    process.exit(1);
+  }
+}
+
+function openUrl(url: string) {
+  const cmd =
+    process.platform === "darwin"
+      ? `open "${url}"`
+      : process.platform === "win32"
+        ? `start "" "${url}"`
+        : `xdg-open "${url}"`;
+  try {
+    execSync(cmd, { stdio: "ignore" });
+    console.log(chalk.green(`Opened ${url}`));
+  } catch {
+    console.log(url);
+  }
+}
+
+// Resolve an issues/issue target to owner/repo: a URL, owner/repo, or a bare
+// name that matches an indexed repo. No clone required — it's a remote lookup.
+function resolveOwnerRepo(input: string): string | null {
+  const parsed = parseGitHubUrl(input);
+  if (parsed) return parsed;
+  if (input.includes("/")) return input;
+  const e = db.get(input) ?? db.resolveName(input)[0];
+  return e?.id ?? null;
+}
+
+// `clone issues <repo>` — list open (or --state) issues for a repo (gh issue list).
+async function cmdIssues(
+  input: string,
+  opts: { state?: string; limit?: string; label?: string; web?: boolean; json?: boolean } = {}
+) {
+  const ownerRepo = resolveOwnerRepo(input);
+  if (!ownerRepo) {
+    console.error(`Couldn't resolve a repo from "${input}" (use owner/repo).`);
+    process.exit(1);
+  }
+  if (opts.web) return openUrl(`https://github.com/${ownerRepo}/issues`);
+  const [owner, repo] = ownerRepo.split("/");
+  const state = (["open", "closed", "all"].includes(opts.state || "") ? opts.state : "open") as
+    | "open"
+    | "closed"
+    | "all";
+  try {
+    const issues = await fetchIssues(owner, repo, {
+      state,
+      perPage: opts.limit ? parseInt(opts.limit, 10) : 30,
+      labels: opts.label,
+    });
+    if (opts.json) return console.log(JSON.stringify(issues, null, 2));
+    printIssues(ownerRepo, issues, { state });
+  } catch (e) {
+    console.error(chalk.red(`Failed to fetch issues for ${ownerRepo}: ${(e as Error).message}`));
+    process.exit(1);
+  }
+}
+
+// `clone issue <repo> <number>` — view a single issue (gh issue view).
+async function cmdIssue(
+  input: string,
+  number: string,
+  opts: { web?: boolean; comments?: boolean; json?: boolean } = {}
+) {
+  const ownerRepo = resolveOwnerRepo(input);
+  if (!ownerRepo) {
+    console.error(`Couldn't resolve a repo from "${input}" (use owner/repo).`);
+    process.exit(1);
+  }
+  const n = parseInt(number, 10);
+  if (!n) {
+    console.error(`Invalid issue number: ${number}`);
+    process.exit(1);
+  }
+  if (opts.web) return openUrl(`https://github.com/${ownerRepo}/issues/${n}`);
+  const [owner, repo] = ownerRepo.split("/");
+  try {
+    const issue = await fetchIssue(owner, repo, n);
+    const comments = opts.comments ? await fetchIssueComments(owner, repo, n) : [];
+    if (opts.json) return console.log(JSON.stringify({ issue, comments }, null, 2));
+    if (issue.isPullRequest) console.log(chalk.dim(`  (note: #${n} is a pull request)`));
+    printIssue(issue, comments);
+  } catch (e) {
+    console.error(chalk.red(`Failed to fetch ${ownerRepo}#${n}: ${(e as Error).message}`));
     process.exit(1);
   }
 }
@@ -3658,6 +3748,28 @@ program
   .alias("open")
   .description("Open the repo's GitHub page in the default browser")
   .action(cmdBrowse);
+
+program
+  .command("issues <repo>")
+  .description("List a repo's GitHub issues (like `gh issue list`); accepts owner/repo or a bare indexed name")
+  .option("-s, --state <state>", "open | closed | all (default: open)")
+  .option("-n, --limit <n>", "Max issues to show (default 30, max 100)")
+  .option("-l, --label <label>", "Filter by label")
+  .option("-w, --web", "Open the repo's issues page in the browser instead")
+  .option("-j, --json", "Emit JSON")
+  .action((repo, opts) =>
+    cmdIssues(repo, { state: opts.state, limit: opts.limit, label: opts.label, web: opts.web, json: opts.json })
+  );
+
+program
+  .command("issue <repo> <number>")
+  .description("View a single GitHub issue (like `gh issue view`)")
+  .option("-c, --comments", "Also show the issue's comments")
+  .option("-w, --web", "Open the issue in the browser instead")
+  .option("-j, --json", "Emit JSON")
+  .action((repo, number, opts) =>
+    cmdIssue(repo, number, { comments: opts.comments, web: opts.web, json: opts.json })
+  );
 
 program
   .command("list")

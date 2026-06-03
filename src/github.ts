@@ -268,3 +268,104 @@ export async function fetchTrendingDetailed(
 
   return out;
 }
+
+// --- Issues (uses the same Octokit client; the Issues API also returns PRs,
+// which we filter out so this is real issues only, like `gh issue list`). ---
+
+export interface IssueSummary {
+  number: number;
+  title: string;
+  state: string; // open | closed
+  user: string;
+  comments: number;
+  labels: string[];
+  createdAt: string;
+  url: string;
+}
+
+function labelNames(labels: any[]): string[] {
+  return (labels || [])
+    .map((l) => (typeof l === "string" ? l : l?.name || ""))
+    .filter(Boolean);
+}
+
+export async function fetchIssues(
+  owner: string,
+  repo: string,
+  opts: { state?: "open" | "closed" | "all"; perPage?: number; labels?: string } = {}
+): Promise<IssueSummary[]> {
+  const { data } = await getOctokit().rest.issues.listForRepo({
+    owner,
+    repo,
+    state: opts.state ?? "open",
+    per_page: Math.min(opts.perPage ?? 30, 100),
+    ...(opts.labels ? { labels: opts.labels } : {}),
+  });
+  return data
+    .filter((i: any) => !i.pull_request) // drop PRs — the API lumps them in
+    .map((i: any) => ({
+      number: i.number,
+      title: i.title,
+      state: i.state,
+      user: i.user?.login ?? "?",
+      comments: i.comments,
+      labels: labelNames(i.labels),
+      createdAt: i.created_at,
+      url: i.html_url,
+    }));
+}
+
+export interface IssueDetail extends IssueSummary {
+  body: string;
+  closedAt: string | null;
+  isPullRequest: boolean;
+}
+
+export async function fetchIssue(
+  owner: string,
+  repo: string,
+  number: number
+): Promise<IssueDetail> {
+  const { data: i } = await getOctokit().rest.issues.get({
+    owner,
+    repo,
+    issue_number: number,
+  });
+  return {
+    number: i.number,
+    title: i.title,
+    state: i.state,
+    user: i.user?.login ?? "?",
+    comments: i.comments,
+    labels: labelNames(i.labels),
+    createdAt: i.created_at,
+    url: i.html_url,
+    body: i.body || "",
+    closedAt: i.closed_at,
+    isPullRequest: !!(i as any).pull_request,
+  };
+}
+
+export interface IssueComment {
+  user: string;
+  body: string;
+  createdAt: string;
+}
+
+export async function fetchIssueComments(
+  owner: string,
+  repo: string,
+  number: number
+): Promise<IssueComment[]> {
+  const { data } = await getOctokit().rest.issues.listComments({
+    owner,
+    repo,
+    issue_number: number,
+    per_page: 100,
+  });
+  return data.map((c: any) => ({
+    user: c.user?.login ?? "?",
+    body: c.body || "",
+    createdAt: c.created_at,
+  }));
+}

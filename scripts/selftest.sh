@@ -748,6 +748,15 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════════════
+hdr "50. issues (GitHub issues lookup, network)"
+grepout "issues lists (or none) for a repo" "issue\(s\) in|No open issues" clone issues ollama/ollama -n 3
+grepout "issues --json emits an array"      "^\[|\"number\"" clone issues ollama/ollama -n 2 --json
+grepout "issues --state closed works"       "closed issue|No closed" clone issues ollama/ollama --state closed -n 2
+assert "issue <n> --json returns that number" \
+  bash -c 'clone issue sharkdp/fd 1 --json 2>/dev/null | grep -q "\"number\": *1"'
+grepout "issue <n> renders a single view"   "#1 |open|closed|pull request" clone issue sharkdp/fd 1
+
+# ════════════════════════════════════════════════════════════════════
 hdr "RESULTS"
 printf '\n  \033[32mPASS=%d\033[0m  \033[31mFAIL=%d\033[0m\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then

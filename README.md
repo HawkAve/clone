@@ -83,6 +83,8 @@ clone doctor                  # full health check: integrity + source + build + 
 clone reason owner/repo --explicit   # protect from orphan cleanup (pacman -D --asexplicit)
 clone reason owner/repo --asdeps     # mark as a dependency (orphan-eligible)
 clone changelog owner/repo    # commits landed upstream since you installed it (pacman -Qc)
+clone issues owner/repo       # list a repo's open GitHub issues (like `gh issue list`); --state/--label/--web/--json
+clone issue owner/repo 123    # view a single issue (like `gh issue view`); --comments, --web, --json
 clone owns ~/.local/bin/foo   # which repo owns a path / symlink (pacman -Qo)
 clone path yazi               # print a repo's directory (resolves bare names)
 cd "$(clone path yazi)"       # …jump to it (a CLI can't cd your shell — wrap it)

@@ -9,6 +9,8 @@ _clone() {
     'info:Detailed info on a repo (like pacman -Qi)'
     'i:Alias for info'
     'browse:Open the repo on GitHub in the default browser'
+    'issues:List a repo'''s GitHub issues (gh issue list)'
+    'issue:View a single GitHub issue (gh issue view)'
     'open:Alias for browse'
     'list:List all repos with optional filters'
     'ls:Alias for list'
@@ -106,7 +108,7 @@ _clone() {
       ;;
     args)
       case $words[1] in
-        info|i|remove|rm|uninstall|un|install|in|update|up|browse|open|reason|check|changelog|cl|path)
+        info|i|remove|rm|uninstall|un|install|in|update|up|browse|open|reason|check|changelog|cl|path|issues|issue)
           if [[ -f "$db_dir/clone.db" ]]; then
             local -a repos=(${(f)"$(sqlite3 "$db_dir/clone.db" "SELECT id FROM repos ORDER BY id" 2>/dev/null)"})
             compadd -a repos
@@ -118,6 +120,8 @@ _clone() {
             info|i) compadd -- '-r' '--remote' ;;
             reason) compadd -- '-e' '--explicit' '--asdeps' ;;
             check) compadd -- '-a' '--all' '--source' '--build' ;;
+            issues) compadd -- '-s' '--state' '-n' '--limit' '-l' '--label' '-w' '--web' '-j' '--json' ;;
+            issue) compadd -- '-c' '--comments' '-w' '--web' '-j' '--json' ;;
           esac
           ;;
         owns)

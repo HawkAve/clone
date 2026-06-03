@@ -521,3 +521,65 @@ export function printStats(stats: {
   }
   console.log();
 }
+
+// --- Issues ---
+
+import type { IssueSummary, IssueDetail, IssueComment } from "./github.js";
+
+// Compact "3d", "5mo", "2y" relative age from an ISO timestamp.
+function ago(iso: string): string {
+  const then = Date.parse(iso);
+  if (!then) return "";
+  const s = Math.max(0, (Date.now() - then) / 1000);
+  const u: [number, string][] = [
+    [31536000, "y"], [2592000, "mo"], [604800, "w"], [86400, "d"], [3600, "h"], [60, "m"],
+  ];
+  for (const [secs, label] of u) if (s >= secs) return `${Math.floor(s / secs)}${label}`;
+  return "now";
+}
+
+export function printIssues(
+  ownerRepo: string,
+  issues: IssueSummary[],
+  opts: { state?: string } = {}
+) {
+  if (issues.length === 0) {
+    console.log(chalk.dim(`  No ${opts.state ?? "open"} issues for ${ownerRepo}.`));
+    return;
+  }
+  console.log(
+    chalk.bold(`\n  ${issues.length} ${opts.state ?? "open"} issue(s) in ${chalk.cyan(ownerRepo)}:\n`)
+  );
+  const w = Math.max(...issues.map((i) => String(i.number).length));
+  for (const i of issues) {
+    const dot = i.state === "open" ? chalk.green("●") : chalk.magenta("◆");
+    const num = chalk.yellow(`#${String(i.number).padStart(w)}`);
+    const meta = chalk.dim(
+      `${i.user} · ${ago(i.createdAt)}` + (i.comments ? ` · 💬${i.comments}` : "")
+    );
+    const labels = i.labels.length ? "  " + i.labels.map((l) => chalk.cyan(`[${l}]`)).join(" ") : "";
+    console.log(`  ${dot} ${num}  ${i.title}${labels}`);
+    console.log(`        ${meta}`);
+  }
+  console.log();
+}
+
+export function printIssue(issue: IssueDetail, comments: IssueComment[] = []) {
+  const dot = issue.state === "open" ? chalk.green("● open") : chalk.magenta("◆ closed");
+  console.log();
+  console.log(`  ${chalk.yellow(`#${issue.number}`)} ${chalk.bold(issue.title)}`);
+  console.log(
+    `  ${dot} · ${issue.user} · opened ${ago(issue.createdAt)} ago` +
+      (issue.comments ? ` · ${issue.comments} comment(s)` : "")
+  );
+  if (issue.labels.length) console.log("  " + issue.labels.map((l) => chalk.cyan(`[${l}]`)).join(" "));
+  console.log(chalk.dim("  " + "─".repeat(50)));
+  const body = (issue.body || "(no description)").trim().split("\n");
+  for (const ln of body.slice(0, 40)) console.log("  " + chalk.reset(ln));
+  if (body.length > 40) console.log(chalk.dim(`  … (${body.length - 40} more lines — see ${issue.url})`));
+  for (const c of comments) {
+    console.log(chalk.dim(`\n  ── ${c.user} · ${ago(c.createdAt)} ago ──`));
+    for (const ln of (c.body || "").trim().split("\n").slice(0, 20)) console.log("  " + chalk.reset(ln));
+  }
+  console.log(chalk.dim(`\n  ${issue.url}\n`));
+}
