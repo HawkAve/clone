@@ -26,8 +26,9 @@ export interface RepoEntry {
   installed_commit?: string; // git HEAD at last successful build
   installed_at?: string; // ISO timestamp of last successful build
   artifacts?: string; // JSON array of bin paths placed on PATH
-  install_method?: string; // 'copy' (self-contained binary) | 'symlink' (into kept worktree)
+  install_method?: string; // 'copy' (self-contained binary) | 'symlink' (into kept worktree) | 'external' | 'uvtool'
   build_path?: string; // kept build worktree path (empty if ephemeral build was removed)
+  pinned_ref?: string; // git ref (tag/branch/commit) this install is pinned to; '' = track HEAD
 }
 
 // Fields that may be updated via setInstall().
@@ -42,6 +43,7 @@ export type InstallFields = Partial<
     | "artifacts"
     | "install_method"
     | "build_path"
+    | "pinned_ref"
   >
 >;
 
@@ -56,6 +58,7 @@ const LIFECYCLE_COLUMNS: Record<string, string> = {
   artifacts: "TEXT DEFAULT '[]'",
   install_method: "TEXT DEFAULT ''",
   build_path: "TEXT DEFAULT ''",
+  pinned_ref: "TEXT DEFAULT ''",
 };
 
 export class CloneDB {
@@ -103,8 +106,9 @@ export class CloneDB {
         installed_at TEXT DEFAULT '',
         artifacts TEXT DEFAULT '[]',
         install_method TEXT DEFAULT '',
-        build_path TEXT DEFAULT ''
-      )
+        build_path TEXT DEFAULT '',
+        pinned_ref TEXT DEFAULT ''
+)
     `);
     this.migrate();
     // Dependency edges: `parent` requires `child` (child installed as a dep of parent).
@@ -181,6 +185,7 @@ export class CloneDB {
       artifacts: row.artifacts || "[]",
       install_method: row.install_method || "",
       build_path: row.build_path || "",
+      pinned_ref: row.pinned_ref || "",
     };
   }
 

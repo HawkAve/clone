@@ -38,6 +38,8 @@ import type { TrendingRepo, TrendingOptions } from "./github.js";
 import {
   gitClone,
   gitCloneLocal,
+  gitResolveRef,
+  gitFetchRef,
   gitPull,
   gitRemoteUrl,
   gitHeadCommit,
@@ -1220,31 +1222,29 @@ function buildAndRecord(
   ownerRepo: string,
   sourcePath: string,
   recipe: BuildRecipe,
-  opts: { reason?: string; buildOnly?: boolean; keepBuild?: boolean }
+  opts: { reason?: string; buildOnly?: boolean; keepBuild?: boolean; ref?: string }
 ): boolean {
   const buildPath = join(config.buildDir, ownerRepo);
   const keep = !!(config.keepBuild || opts.keepBuild || recipe.interpreted);
+  // Pin target: build this exact ref (tag/branch/commit) instead of source HEAD.
+  const commitish = opts.ref || gitHeadCommit(sourcePath) || "HEAD";
 
   // Set up the build workspace as a worktree of source — source stays pristine.
   let workDir = buildPath;
   let madeWorktree = false;
   if (existsSync(join(sourcePath, ".git"))) {
     if (existsSync(buildPath)) {
-      gitCheckoutDetached(buildPath, gitHeadCommit(sourcePath) ?? "HEAD"); // reuse → incremental
+      gitCheckoutDetached(buildPath, commitish); // reuse → incremental, at the pin
       madeWorktree = true;
     } else {
       mkdirSync(dirname(buildPath), { recursive: true });
-      if (gitWorktreeAdd(sourcePath, buildPath)) madeWorktree = true;
+      if (gitWorktreeAdd(sourcePath, buildPath, commitish)) madeWorktree = true;
     }
   }
   if (!madeWorktree) {
     workDir = sourcePath; // rare fallback: no commit / not a git repo
     console.log(chalk.dim(`  (building in source — no worktree available)`));
   }
-
-  const result = buildRepo(workDir, recipe, {
-    onStep: (cmd) => console.log(`  ${chalk.yellow("$")} ${cmd}`),
-  });
 
   const removeWorktreeIfEphemeral = () => {
     if (madeWorktree && !keep) {
@@ -1256,8 +1256,52 @@ function buildAndRecord(
       }
     }
   };
-  const base = { install_reason: opts.reason, build_system: recipe.system };
+  const base = {
+    install_reason: opts.reason,
+    build_system: recipe.system,
+    pinned_ref: opts.ref || "", // explicit reinstall without @ref unpins (tracks HEAD)
+  };
   const keptPath = keep && madeWorktree ? buildPath : "";
+
+  // Python via `uv tool install`: isolated venv, executables into binDir. We
+  // capture the new bins (binDir snapshot) and record the tool name so uninstall
+  // can `uv tool uninstall`. The worktree is ephemeral (uv copies into its venv).
+  if (recipe.uvtool) {
+    removeArtifacts(JSON.parse(db.get(ownerRepo)?.artifacts || "[]"));
+    const commit = gitHeadCommit(workDir) ?? gitHeadCommit(sourcePath) ?? "";
+    const before = new Set(existsSync(config.binDir) ? readdirSync(config.binDir) : []);
+    console.log(`  ${chalk.yellow("$")} uv tool install ${chalk.dim("(isolated venv)")}`);
+    try {
+      execSync(`uv tool install --force ${JSON.stringify(workDir)}`, {
+        stdio: "inherit",
+        env: { ...process.env, UV_TOOL_BIN_DIR: config.binDir },
+      });
+    } catch {
+      console.error(chalk.red(`\nuv tool install failed.`));
+      db.setInstall(ownerRepo, { ...base, install_state: "failed", build_path: "" });
+      removeWorktreeIfEphemeral();
+      return false;
+    }
+    const after = existsSync(config.binDir) ? readdirSync(config.binDir) : [];
+    const newBins = after.filter((n) => !before.has(n)).map((n) => join(config.binDir, n));
+    removeWorktreeIfEphemeral();
+    db.setInstall(ownerRepo, {
+      ...base,
+      install_state: "installed",
+      installed_commit: commit,
+      installed_at: nowIso(),
+      artifacts: JSON.stringify(newBins),
+      install_method: "uvtool",
+      build_path: recipe.pkgName || "", // uv tool name, for `uv tool uninstall`
+    });
+    console.log(chalk.green(`\nInstalled ${ownerRepo}`) + chalk.dim("  (uv tool)"));
+    for (const b of newBins) console.log(`  ${chalk.green("→")} ${b}`);
+    return true;
+  }
+
+  const result = buildRepo(workDir, recipe, {
+    onStep: (cmd) => console.log(`  ${chalk.yellow("$")} ${cmd}`),
+  });
 
   if (!result.ok) {
     console.error(chalk.red(`\nBuild failed at: ${chalk.bold(result.failedStep ?? "?")}`));
@@ -1266,7 +1310,9 @@ function buildAndRecord(
     return false;
   }
 
-  const commit = gitHeadCommit(sourcePath) ?? ""; // record the pristine SOURCE head
+  // Record the commit we actually built — the worktree HEAD (= the pinned ref,
+  // or source HEAD when unpinned).
+  const commit = gitHeadCommit(workDir) ?? gitHeadCommit(sourcePath) ?? "";
   const stamp = nowIso();
   // Replace any prior binaries only after a successful build (a failed build keeps them).
   removeArtifacts(JSON.parse(db.get(ownerRepo)?.artifacts || "[]"));
@@ -1294,11 +1340,37 @@ function buildAndRecord(
     return true;
   }
 
+  // Conflict check (pacman-style): a produced bin name already owned by ANOTHER
+  // tracked repo is a conflict — never clobber it; report who owns it and skip.
+  const ownedByOther = new Map<string, string>();
+  for (const e of db.list({})) {
+    if (e.id === ownerRepo) continue;
+    for (const a of JSON.parse(e.artifacts || "[]") as string[]) ownedByOther.set(a, e.id);
+  }
+  const conflicts: { name: string; owner: string }[] = [];
+  const placeable = result.producedBinaries.filter((b) => {
+    const owner = ownedByOther.get(join(config.binDir, b.name));
+    if (owner) {
+      conflicts.push({ name: b.name, owner });
+      return false;
+    }
+    return true;
+  });
+  if (conflicts.length) {
+    console.log();
+    for (const c of conflicts) {
+      console.log(
+        chalk.yellow(`  ⚠ conflict: ${c.name} is already owned by ${chalk.cyan(c.owner)}`) +
+          chalk.dim(` — uninstall it first, or rename. Skipping.`)
+      );
+    }
+  }
+
   // Place produced binaries: symlink into a kept worktree, or copy out (then drop it).
   const { linked, skipped } =
     keptPath
-      ? linkArtifacts(result.producedBinaries, config.binDir)
-      : copyArtifacts(result.producedBinaries, config.binDir);
+      ? linkArtifacts(placeable, config.binDir)
+      : copyArtifacts(placeable, config.binDir);
   const method = keptPath ? "symlink" : "copy";
   db.setInstall(ownerRepo, {
     ...base,
@@ -1337,8 +1409,27 @@ async function cmdInstall(
     keepBuild?: boolean;
     ask?: boolean;
   } = {},
-  _chain: Set<string> = new Set() // cycle guard for recursive dep installs
-) {
+  _chain: Set<string> = new Set(), // cycle guard for recursive dep installs
+  _txn?: string[] // repos installed in this transaction, for dep-chain rollback
+): Promise<boolean> {
+  const txn = _txn ?? []; // shared across a dependency chain
+  // Optional version pin: owner/repo@<tag|branch|commit>. Strip it off the
+  // target (not for local paths, ssh, or URLs — those keep their '@').
+  let targetRef: string | undefined;
+  {
+    const at = input.lastIndexOf("@");
+    if (
+      at > 0 &&
+      !input.startsWith("git@") &&
+      !input.includes("://") &&
+      !existsSync(input) &&
+      /^[^@\s]+\/[^@\s]+$/.test(input.slice(0, at))
+    ) {
+      targetRef = input.slice(at + 1);
+      input = input.slice(0, at);
+    }
+  }
+
   // A local path target (paru -B): build a repo already on disk, in place.
   const looksLikePath =
     input === "." ||
@@ -1394,14 +1485,29 @@ async function cmdInstall(
     }
   }
 
+  // Resolve a version pin into the source repo (fetch if a shallow clone lacks it).
+  if (targetRef) {
+    if (!gitResolveRef(dest, targetRef)) {
+      console.log(chalk.cyan(`Fetching ${targetRef}…`));
+      gitFetchRef(dest, targetRef);
+    }
+    if (!gitResolveRef(dest, targetRef)) {
+      console.error(
+        chalk.red(`Ref not found: ${chalk.bold(targetRef)} — no such tag/branch/commit in ${ownerRepo}.`)
+      );
+      process.exit(1);
+    }
+  }
+
   const entry = db.get(ownerRepo);
   const reason = reconcileReason(
     entry?.install_reason,
     opts.asDeps ? "dependency" : "explicit"
   );
-  const head = gitHeadCommit(dest);
+  // The commit we'd build: the pinned ref's commit, else source HEAD.
+  const head = (targetRef && gitResolveRef(dest, targetRef)) || gitHeadCommit(dest);
 
-  // --needed: already installed at this commit → skip rebuild.
+  // --needed: already installed at this exact commit → skip rebuild.
   if (
     opts.needed &&
     !opts.force &&
@@ -1411,10 +1517,10 @@ async function cmdInstall(
   ) {
     console.log(
       chalk.green(`${ownerRepo} is up to date`) +
-        chalk.dim(` (installed @ ${head?.slice(0, 7)})`)
+        chalk.dim(` (installed @ ${head?.slice(0, 7)}${targetRef ? ` = ${targetRef}` : ""})`)
     );
     if (entry.install_reason !== reason) db.setInstall(ownerRepo, { install_reason: reason });
-    return;
+    return true; // already satisfied
   }
 
   // 2. Detect how to build.
@@ -1432,16 +1538,16 @@ async function cmdInstall(
       );
       db.setInstall(ownerRepo, { install_reason: reason });
       process.exitCode = 1;
-      return;
+      return false;
     }
     recipe = await authorRecipe(dest, ownerRepo, recipe);
     if (!recipe) {
       // User opted not to build — leave it as a plain clone.
       db.setInstall(ownerRepo, { install_reason: reason });
-      return;
+      return false;
     }
   }
-  if (!recipe) return; // (unreachable — narrows the type for TS)
+  if (!recipe) return false; // (unreachable — narrows the type for TS)
 
   // 3. Review before building (we're about to run upstream code).
   console.log();
@@ -1464,11 +1570,12 @@ async function cmdInstall(
     const ok = await confirm(`Proceed with build?`);
     if (!ok) {
       console.log("Cancelled.");
-      return;
+      return false;
     }
   }
 
   // 3.5. Resolve declared dependencies first (they may be build-time needs).
+  //      Transactional: if any dep fails, roll back the ones we just installed.
   if (recipe.deps && recipe.deps.length) {
     _chain.add(ownerRepo);
     for (const dep of recipe.deps) {
@@ -1478,11 +1585,20 @@ async function cmdInstall(
         continue;
       }
       console.log(chalk.cyan(`\n→ dependency of ${ownerRepo}: ${depId}`));
-      await cmdInstall(
+      const okDep = await cmdInstall(
         depId,
         { asDeps: true, yes: opts.yes, needed: true },
-        _chain
+        _chain,
+        txn
       );
+      if (!okDep) {
+        console.error(
+          chalk.red(`\nDependency ${depId} failed — rolling back this install.`)
+        );
+        rollbackInstalls(txn);
+        process.exitCode = 1;
+        return false;
+      }
       db.addDep(ownerRepo, depId); // record edge even if the dep was already present
     }
   }
@@ -1491,14 +1607,63 @@ async function cmdInstall(
   if (!fireHooks("install", "pre", { repo: ownerRepo, cwd: dest })) {
     console.error(chalk.red(`Aborted by pre-install hook.`));
     process.exitCode = 1;
-    return;
+    return false;
   }
   const built = buildAndRecord(ownerRepo, dest, recipe, {
     reason,
     buildOnly: opts.buildOnly,
     keepBuild: opts.keepBuild,
+    ref: targetRef,
   });
-  if (built) fireHooks("install", "post", { repo: ownerRepo, cwd: dest });
+  if (built) {
+    txn.push(ownerRepo); // a dep records itself in the shared transaction
+    fireHooks("install", "post", { repo: ownerRepo, cwd: dest });
+  }
+  return built;
+}
+
+// Remove an install's placed binaries + build workspace, honoring how it was
+// installed: uv tool needs its own uninstall; kept worktrees get pruned.
+// Returns the count of artifacts removed.
+function tearDownArtifacts(entry: RepoEntry): number {
+  const artifacts: string[] = JSON.parse(entry.artifacts || "[]");
+  if (entry.install_method === "uvtool") {
+    if (entry.build_path) {
+      try {
+        execSync(`uv tool uninstall ${JSON.stringify(entry.build_path)}`, {
+          stdio: "ignore",
+          env: { ...process.env, UV_TOOL_BIN_DIR: config.binDir },
+        });
+      } catch {
+        /* tool already gone — fall through to clean any records */
+      }
+    }
+    removeArtifacts(artifacts);
+    return artifacts.length;
+  }
+  const removed = removeArtifacts(artifacts);
+  if (entry.build_path) gitWorktreeRemove(entry.path, entry.build_path);
+  return removed;
+}
+
+// Undo installs from a failed transaction (newest first): unlink artifacts,
+// drop the build worktree, revert lifecycle to 'cloned'. Source is kept.
+function rollbackInstalls(ids: string[]) {
+  for (const id of [...ids].reverse()) {
+    const e = db.get(id);
+    if (!e) continue;
+    tearDownArtifacts(e);
+    db.setInstall(id, {
+      install_state: "cloned",
+      installed_commit: "",
+      installed_at: "",
+      artifacts: "[]",
+      install_method: "",
+      build_path: "",
+      pinned_ref: "",
+    });
+    console.log(chalk.dim(`  ↶ rolled back ${id}`));
+  }
 }
 
 async function cmdUninstall(ownerRepo: string) {
@@ -1508,10 +1673,7 @@ async function cmdUninstall(ownerRepo: string) {
     process.exit(1);
   }
 
-  const artifacts: string[] = JSON.parse(entry.artifacts || "[]");
-  const removed = removeArtifacts(artifacts); // symlinks or copied files
-  // Tear down the build worktree if one was kept (npm / --keep-build).
-  if (entry.build_path) gitWorktreeRemove(entry.path, entry.build_path);
+  const removed = tearDownArtifacts(entry); // uv tool uninstall / unlink + prune worktree
 
   db.setInstall(ownerRepo, {
     install_state: "cloned",
@@ -1520,15 +1682,17 @@ async function cmdUninstall(ownerRepo: string) {
     artifacts: "[]",
     install_method: "",
     build_path: "",
+    pinned_ref: "",
   });
 
   console.log(
     `${chalk.green("Uninstalled")} ${ownerRepo} ` +
       chalk.dim(`(removed ${removed} binar${removed === 1 ? "y" : "ies"}; source kept clean at ${entry.path})`)
   );
-  if (entry.build_system === "python") {
+  // pip --user installs (no uv) place scripts clone can't track — hint manual cleanup.
+  if (entry.build_system === "python" && entry.install_method !== "uvtool") {
     console.log(
-      chalk.dim(`  Note: ${entry.build_system} scripts are pip-managed — run \`pip uninstall\` to remove them.`)
+      chalk.dim(`  Note: pip-managed scripts may remain — run \`pip uninstall\` to remove them.`)
     );
   }
 }
@@ -1541,6 +1705,17 @@ function deleteRepo(ownerRepo: string) {
   const artifacts: string[] = entry ? JSON.parse(entry.artifacts || "[]") : [];
 
   fireHooks("remove", "pre", { repo: ownerRepo, cwd: repoPath });
+  // uv-tool installs need their own uninstall (isolated venv); else just unlink.
+  if (entry?.install_method === "uvtool" && entry.build_path) {
+    try {
+      execSync(`uv tool uninstall ${JSON.stringify(entry.build_path)}`, {
+        stdio: "ignore",
+        env: { ...process.env, UV_TOOL_BIN_DIR: config.binDir },
+      });
+    } catch {
+      /* already gone */
+    }
+  }
   if (artifacts.length) removeArtifacts(artifacts); // copies or symlinks
 
   // Tear down the build worktree first (so git's worktree list stays sane), then source.
@@ -1685,6 +1860,11 @@ async function cmdUpdate(
         console.log(`  [${i}/${repos.length}] ${repo.id} ${chalk.dim("ignored")}`);
         continue;
       }
+      if (repo.pinned_ref) {
+        console.log(`  [${i}/${repos.length}] ${repo.id} ${chalk.dim(`pinned @ ${repo.pinned_ref}`)}`);
+        skipped++;
+        continue;
+      }
       const before = gitHeadCommit(repo.path);
       const ok = gitPull(repo.path, { ffOnly: true, quiet: true });
       const after = gitHeadCommit(repo.path);
@@ -1798,17 +1978,22 @@ async function cmdOutdated(
   // Default to installed/built repos (the ones you care about keeping current);
   // --all checks every indexed repo.
   const ignored = ignoreSet(opts.ignore);
-  const repos = (opts.all ? db.list({}) : db.list({ installed: true })).filter(
+  const all = (opts.all ? db.list({}) : db.list({ installed: true })).filter(
     (r) => !ignored.has(r.id.toLowerCase())
   );
+  // Version-pinned repos (install repo@<ref>) are intentionally held — skip them.
+  const pinnedCount = all.filter((r) => r.pinned_ref).length;
+  const repos = all.filter((r) => !r.pinned_ref);
   if (repos.length === 0) {
     console.log(
       opts.all
         ? "No repos indexed."
         : "No installed repos. Use --all to check every cloned repo."
     );
+    if (pinnedCount) console.log(chalk.dim(`  (${pinnedCount} pinned repo(s) held at their ref)`));
     return;
   }
+  if (pinnedCount) console.log(chalk.dim(`(holding ${pinnedCount} pinned repo(s) at their ref)`));
 
   console.log(
     chalk.dim(
@@ -1864,6 +2049,7 @@ async function cmdClean(
   opts: {
     cache?: boolean;
     builds?: boolean;
+    build?: boolean;
     duplicates?: boolean;
     source?: boolean;
     repos?: string[];
@@ -1872,6 +2058,10 @@ async function cmdClean(
     yes?: boolean;
   } = {}
 ) {
+  // `--build` (singular, mirrors `check --build`) tidies the whole build tree:
+  // clone worktrees not backing an install + redundant flat dirs. `--builds`
+  // (plural) is kept as an alias.
+  const tidyBuild = !!(opts.build || opts.builds);
   // 1. Broken bindir symlinks — but ONLY ones clone recorded as its own artifacts.
   //    A broken symlink in a shared bindir (~/.local/bin) that the user created
   //    by hand must never be touched, even if it points into the repos root.
@@ -1911,7 +2101,7 @@ async function cmdClean(
       .filter(Boolean)
   );
   const buildDirs: { repo: string; dir: string; size: string; source: string }[] = [];
-  if (opts.builds && existsSync(config.buildDir)) {
+  if (tidyBuild && existsSync(config.buildDir)) {
     for (const owner of readdirSync(config.buildDir)) {
       const ownerPath = join(config.buildDir, owner);
       let repos: string[];
@@ -1933,6 +2123,36 @@ async function cmdClean(
           source: db.get(id)?.path ?? join(config.baseDir, id),
         });
       }
+    }
+  }
+
+  // 3b. Redundant flat build dirs (pre-existing manual builds): a source/ twin
+  //     exists and there's no unique state (venv/.env) → reclaimable. Skips
+  //     clone-tracked owners and orphans (no source clone). Mirrors check --build.
+  const redundantBuilds: { name: string; dir: string; size: string; bytes: number }[] = [];
+  if (tidyBuild && existsSync(config.buildDir)) {
+    const trackedTops = new Set<string>();
+    const sourceNames = new Set<string>();
+    for (const e of db.list({})) {
+      if (e.build_path && e.build_path.startsWith(config.buildDir + "/"))
+        trackedTops.add(relative(config.buildDir, e.build_path).split("/")[0]);
+      if (e.path.startsWith(config.baseDir + "/")) sourceNames.add(e.id.split("/").pop()!);
+    }
+    for (const name of readdirSync(config.buildDir)) {
+      const p = join(config.buildDir, name);
+      try {
+        if (!statSync(p).isDirectory()) continue;
+      } catch {
+        continue;
+      }
+      if (trackedTops.has(name) || !sourceNames.has(name)) continue; // tracked or orphan → leave
+      const unique =
+        existsSync(join(p, "venv", "bin", "python")) ||
+        existsSync(join(p, ".venv", "bin", "python")) ||
+        existsSync(join(p, ".env"));
+      if (unique) continue; // venv/.env → leave for a manual call
+      const bytes = duBytes(p);
+      redundantBuilds.push({ name, dir: p, size: humanSize(bytes), bytes });
     }
   }
 
@@ -1968,11 +2188,18 @@ async function cmdClean(
   const dupDir = join(config.baseDir, "_duplicates");
   const dupItems = existsSync(dupDir) ? readdirSync(dupDir) : [];
 
+  const redundantBuildBytes = redundantBuilds.reduce((s, b) => s + b.bytes, 0);
   console.log(chalk.bold("clean — reclaimable:"));
   console.log(`  broken bin symlinks:    ${brokenLinks.length}`);
   console.log(`  dangling index entries: ${dangling.length}`);
-  if (opts.builds)
+  if (tidyBuild) {
     console.log(`  build worktrees:        ${buildDirs.length}`);
+    console.log(
+      `  redundant build dirs:   ${redundantBuilds.length}  ${chalk.dim(
+        redundantBuilds.length ? humanSize(redundantBuildBytes) : ""
+      )}` + (opts.backup && redundantBuilds.length ? chalk.dim(`  → backup: ${opts.backup}`) : "")
+    );
+  }
   if (opts.source)
     console.log(
       `  source artifacts:       ${sourceArtifacts.length}  ${chalk.dim(
@@ -1995,7 +2222,7 @@ async function cmdClean(
   const nothing =
     !brokenLinks.length &&
     !dangling.length &&
-    (!opts.builds || !buildDirs.length) &&
+    (!tidyBuild || (!buildDirs.length && !redundantBuilds.length)) &&
     (!opts.source || !sourceArtifacts.length) &&
     (!opts.duplicates || !dupItems.length) &&
     !opts.cache;
@@ -2003,9 +2230,10 @@ async function cmdClean(
     console.log(chalk.green("\n  Nothing to clean."));
     return;
   }
-  if (opts.builds && buildDirs.length) {
-    for (const b of buildDirs)
-      console.log(chalk.dim(`    ${b.size}\t${b.dir}`));
+  if (tidyBuild) {
+    for (const b of buildDirs) console.log(chalk.dim(`    ${b.size}\t${b.dir} (worktree)`));
+    redundantBuilds.sort((a, b) => b.bytes - a.bytes);
+    for (const b of redundantBuilds) console.log(chalk.dim(`    ${b.size}\t${b.dir} (redundant)`));
   }
   if (opts.source && sourceArtifacts.length) {
     sourceArtifacts.sort((a, b) => b.bytes - a.bytes);
@@ -2030,7 +2258,7 @@ async function cmdClean(
     db.remove(e.id);
     actions++;
   }
-  if (opts.builds) {
+  if (tidyBuild) {
     for (const b of buildDirs) {
       if (!gitWorktreeRemove(b.source, b.dir)) {
         rmSync(b.dir, { recursive: true, force: true });
@@ -2039,6 +2267,16 @@ async function cmdClean(
         rmdirSync(dirname(b.dir)); // tidy empty owner dir under build/
       } catch {
         /* not empty */
+      }
+      actions++;
+    }
+    for (const b of redundantBuilds) {
+      if (opts.backup) {
+        const dest = join(opts.backup, "_build", b.name); // reversible relocate
+        mkdirSync(dirname(dest), { recursive: true });
+        moveDir(b.dir, dest);
+      } else {
+        rmSync(b.dir, { recursive: true, force: true });
       }
       actions++;
     }
@@ -3456,7 +3694,7 @@ program
   .command("install <repo>")
   .alias("in")
   .description(
-    "Clone (if needed) or build a local path ('.'), build from source, link binaries onto PATH (paru -S/-B)"
+    "Build from source + link binaries onto PATH (paru -S/-B). Pin a version: repo@<tag|branch|commit>"
   )
   .option("--build-only", "Build but do not put binaries on PATH")
   .option("-f, --force", "Rebuild even if already installed at the current commit")
@@ -3465,8 +3703,8 @@ program
   .option("--asdeps", "Record install reason as 'dependency' rather than 'explicit'")
   .option("--keep-build", "Keep the build worktree (incremental rebuilds); symlink instead of copy")
   .option("--ask", "Interactively choose build commands + binary; offer to save a .clone-recipe")
-  .action((repo, opts) =>
-    cmdInstall(repo, {
+  .action(async (repo, opts) => {
+    await cmdInstall(repo, {
       buildOnly: opts.buildOnly,
       force: opts.force,
       needed: opts.needed,
@@ -3474,8 +3712,8 @@ program
       asDeps: opts.asdeps,
       keepBuild: opts.keepBuild,
       ask: opts.ask,
-    })
-  );
+    });
+  });
 
 program
   .command("uninstall <repo>")
@@ -3578,7 +3816,8 @@ program
 program
   .command("clean [repos...]")
   .description("Prune broken bin symlinks, dangling index entries, caches (like pacman -Sc)")
-  .option("--builds", "Also remove build worktrees under build/ not backing a live install")
+  .option("--build", "Tidy the build tree: prune non-backing worktrees + reclaim redundant flat dirs (mirrors check --build)")
+  .option("--builds", "Alias of --build")
   .option("--source", "Also delete regenerable build artifacts (node_modules/target/dist/...) from source repos — skips committed dirs")
   .option("--backup <dir>", "With --source: MOVE artifacts into <dir> (reversible) instead of deleting")
   .option("--cache", "Also clear the trending HTML cache")
@@ -3587,6 +3826,7 @@ program
   .option("-y, --yes", "Skip the confirmation prompt")
   .action((repos, opts) =>
     cmdClean({
+      build: opts.build,
       builds: opts.builds,
       source: opts.source,
       repos,

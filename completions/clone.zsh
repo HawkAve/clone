@@ -138,7 +138,7 @@ _clone() {
           compadd -- '--remove' '-y' '--yes'
           ;;
         clean)
-          compadd -- '--builds' '--source' '--backup' '--cache' '--duplicates' '--dry-run' '-y' '--yes'
+          compadd -- '--build' '--builds' '--source' '--backup' '--cache' '--duplicates' '--dry-run' '-y' '--yes'
           ;;
         log)
           if [[ -f "$db_dir/clone.db" ]]; then

@@ -57,6 +57,7 @@ clone missing                   # list trending repos not yet cloned
 
 # Build from source & install (like paru -S / makepkg -si)
 clone install owner/repo        # clone if needed → detect build → review → build → link binary onto PATH
+clone install owner/repo@v1.2.3 # pin to a tag/branch/commit (held by update until you reinstall); downgrade the same way
 clone install owner/repo -y     # skip the review prompt (build unattended)
 clone install owner/repo --build-only   # build but don't put on PATH
 clone install owner/repo --keep-build   # keep the build worktree for incremental rebuilds (symlink, not copy)
@@ -159,7 +160,7 @@ system from files in the repo, then *shows you the commands before running them*
 | `meson.build` | meson | `meson setup build && meson compile -C build` |
 | `CMakeLists.txt` | cmake | `cmake -B build … && cmake --build build` |
 | `Makefile` | make | `make` |
-| `pyproject.toml` / `setup.py` | python | `pip install --user .` (pip places its own scripts) |
+| `pyproject.toml` / `setup.py` | python | `uv tool install .` (isolated per-tool venv, clean uninstall); falls back to `pip install --user .` if uv is absent |
 
 **Override with `.clone-recipe`.** Drop a `.clone-recipe` file in the repo to take full
 control. Lines are build commands (run in order); `bin: path` lines declare which built
@@ -196,6 +197,23 @@ How should clone build someorg/weird-tool?
 **`uninstall` vs `remove`:** `uninstall` only unlinks the binary and reverts the repo to
 `cloned` — the source stays. `remove` deletes everything (source + binaries + index entry),
 and refuses to nuke a repo with uncommitted changes unless you pass `--force`.
+
+**Closer to pacman/paru — the deeper machinery:**
+- **Version pinning / downgrade** — `clone install owner/repo@<tag|branch|commit>` builds that
+  exact ref (fetching it if a shallow clone lacks it) and *pins* it: `update`/`outdated` hold
+  pinned repos at their ref. Reinstall a different ref to downgrade/upgrade; reinstall with no
+  `@ref` to unpin. `info` shows the pin.
+- **Conflict detection** — if an install would link a binary name another tracked repo already
+  owns, clone reports the conflict and skips it rather than clobbering (pacman's file-conflict
+  rule). Uninstall the other one first, or rename.
+- **Transactional installs** — a dependency chain is atomic: if any `dep:` fails to build,
+  clone rolls back the deps it installed in that run and aborts, leaving nothing half-installed.
+- **Isolated Python** — Python tools install via `uv tool` (a dedicated venv per tool, bin on
+  PATH, clean `uv tool uninstall`), not a global `pip --user` dumping ground.
+
+Genuinely *not* modeled (they don't map to source repos): automatic transitive **system**-dependency
+resolution (repos don't declare system deps in a uniform DB — use `dep: owner/repo` lines for
+repo→repo needs), and pacman's provides/replaces virtual-package web.
 
 **Keeping `source/` pristine — `clone check --source`.** The model only holds if the source
 tree stays *pristine* (you build in a worktree under `build/`, not in `source/`). Over time

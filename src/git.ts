@@ -76,6 +76,41 @@ export function gitCloneLocal(
   }
 }
 
+// Resolve a ref (tag/branch/commit) to its commit SHA in a repo, or null.
+export function gitResolveRef(repoPath: string, ref: string): string | null {
+  try {
+    return execFileSync("git", ["-C", repoPath, "rev-parse", "--verify", `${ref}^{commit}`], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+// Fetch a specific ref (tag/branch/commit) into a repo — needed because a
+// shallow clone won't already have arbitrary tags/history. Returns success.
+export function gitFetchRef(repoPath: string, ref: string): boolean {
+  try {
+    execFileSync("git", ["-C", repoPath, "fetch", "--depth", "1", "origin", ref], {
+      stdio: "ignore",
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    });
+    return true;
+  } catch {
+    // Fall back to a full fetch of tags (some servers reject by-sha shallow fetch).
+    try {
+      execFileSync("git", ["-C", repoPath, "fetch", "--tags", "origin"], {
+        stdio: "ignore",
+        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
 export function gitPull(
   repoPath: string,
   opts: { ffOnly?: boolean; quiet?: boolean } = {}

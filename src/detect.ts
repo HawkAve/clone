@@ -1,5 +1,35 @@
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
+import { execSync } from "child_process";
+
+function uvAvailable(): boolean {
+  try {
+    execSync("command -v uv", { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Best-effort Python package name (for `uv tool install` / `uv tool uninstall`):
+// pyproject [project] name, else setup.py name=, else null.
+function pyPackageName(repoPath: string): string | null {
+  try {
+    const pp = join(repoPath, "pyproject.toml");
+    if (existsSync(pp)) {
+      const m = readFileSync(pp, "utf-8").match(/^\s*name\s*=\s*["']([^"']+)["']/m);
+      if (m) return m[1];
+    }
+    const sp = join(repoPath, "setup.py");
+    if (existsSync(sp)) {
+      const m = readFileSync(sp, "utf-8").match(/name\s*=\s*["']([^"']+)["']/);
+      if (m) return m[1];
+    }
+  } catch {
+    /* unreadable — fall through */
+  }
+  return null;
+}
 
 // A build recipe: the ordered shell commands to run (in the repo dir) plus hints
 // about where produced binaries land. Modelled on makepkg's build()/package()
@@ -12,6 +42,8 @@ export interface BuildRecipe {
   external?: boolean; // installer places its own bins (pip) — skip snapshot-linking
   interpreted?: boolean; // bin references its package (npm) — keep build dir + symlink, don't copy
   deps?: string[]; // other owner/repo this repo needs (from `dep:` recipe lines)
+  uvtool?: boolean; // python: install via `uv tool install` (isolated venv) not pip --user
+  pkgName?: string; // python package/tool name (for `uv tool uninstall`)
 }
 
 const RECIPE_FILE = ".clone-recipe";
@@ -139,7 +171,19 @@ function detectRaw(repoPath: string): BuildRecipe | null {
     return npmRecipe(repoPath);
   }
   if (has(repoPath, "pyproject.toml", "setup.py")) {
-    // pip places its own console_scripts into ~/.local/bin — don't snapshot-link.
+    const pkgName = pyPackageName(repoPath);
+    // Prefer `uv tool install`: isolated per-tool venv, bins on PATH, clean
+    // uninstall. Falls back to `pip install --user` when uv or the name is absent.
+    if (uvAvailable() && pkgName) {
+      return {
+        system: "python",
+        steps: [], // buildAndRecord runs `uv tool install` directly
+        binHints: [],
+        external: true,
+        uvtool: true,
+        pkgName,
+      };
+    }
     return {
       system: "python",
       steps: ["pip install --user ."],

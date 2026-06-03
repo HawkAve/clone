@@ -656,6 +656,93 @@ grepout "doctor includes lifecycle"     "Lifecycle"   clone doctor
 grepout "doctor prints a unified verdict" "summary|healthy|look at" clone doctor
 
 # ════════════════════════════════════════════════════════════════════
+hdr "45. version pin / downgrade (install repo@<ref>)"
+seed test/verpin
+D="$CLONE_ROOT/test/verpin"
+printf '#include <stdio.h>\nint main(void){printf("VER1\\n");return 0;}\n' > "$D/m.c"
+printf 'verapp: m.c\n\tcc -o verapp m.c\n' > "$D/Makefile"
+commit "$D"; git -C "$D" tag v1
+printf '#include <stdio.h>\nint main(void){printf("VER2\\n");return 0;}\n' > "$D/m.c"
+commit "$D"; git -C "$D" tag v2
+clone install test/verpin@v1 -y >/dev/null 2>&1
+assert "pinned @v1 builds the v1 tag"     bash -c '"$CLONE_BIN/verapp" | grep -q VER1'
+grepout "info shows the pin"              "pinned" clone info test/verpin
+grepout "outdated holds pinned repos"     "pinned" clone outdated --all
+clone install test/verpin@v2 -y >/dev/null 2>&1
+assert "re-pin @v2 rebuilds at v2"        bash -c '"$CLONE_BIN/verapp" | grep -q VER2'
+clone install test/verpin -y >/dev/null 2>&1
+assert "plain reinstall unpins (no ref)"  bash -c '! clone info test/verpin 2>&1 | grep -qi pinned'
+
+# ════════════════════════════════════════════════════════════════════
+hdr "46. conflict detection (two repos, same bin name)"
+for x in dupa dupb; do
+  seed test/$x; DD="$CLONE_ROOT/test/$x"
+  printf "#include <stdio.h>\nint main(void){printf(\"$x\\\\n\");return 0;}\n" > "$DD/m.c"
+  printf 'dupbin: m.c\n\tcc -o dupbin m.c\n' > "$DD/Makefile"; commit "$DD"
+done
+clone install test/dupa -y >/dev/null 2>&1
+assert "repo A linked dupbin"             bash -c '"$CLONE_BIN/dupbin" | grep -q dupa'
+grepout "installing B reports the conflict" "conflict.*dupa|owned by" clone install test/dupb -y
+assert "dupbin NOT clobbered (still A)"    bash -c '"$CLONE_BIN/dupbin" | grep -q dupa'
+
+# ════════════════════════════════════════════════════════════════════
+hdr "47. clean --build (reclaim redundant flat dirs)"
+mkdir -p "$SBOX/build/cmaker"; echo x > "$SBOX/build/cmaker/f"          # twin test/cmaker → redundant
+mkdir -p "$SBOX/build/zzz-borphan"; echo x > "$SBOX/build/zzz-borphan/f" # no twin → orphan, left
+mkdir -p "$SBOX/build/ruster/.venv/bin"; touch "$SBOX/build/ruster/.venv/bin/python" # twin+venv → left
+clone clean --build --backup "$SBOX/buildbak" -y >/dev/null 2>&1
+assert "redundant flat dir reclaimed→backup" bash -c '! test -e "$SBOX/build/cmaker" && test -e "$SBOX/buildbak/_build/cmaker"'
+assert "orphan flat dir left in place"     test -d "$SBOX/build/zzz-borphan"
+assert "venv flat dir left (unique state)" test -d "$SBOX/build/ruster"
+
+# ════════════════════════════════════════════════════════════════════
+hdr "48. transactional rollback (a dependency fails)"
+seed test/goodep; DG="$CLONE_ROOT/test/goodep"
+printf '#include <stdio.h>\nint main(void){return 0;}\n' > "$DG/m.c"
+printf 'gdepbin: m.c\n\tcc -o gdepbin m.c\n' > "$DG/Makefile"; commit "$DG"
+seed test/badep; DB2="$CLONE_ROOT/test/badep"
+printf 'all:\n\tfalse\n' > "$DB2/Makefile"; commit "$DB2"
+seed test/parentdep; DP="$CLONE_ROOT/test/parentdep"
+printf '#include <stdio.h>\nint main(void){return 0;}\n' > "$DP/m.c"
+printf 'dep: test/goodep\ndep: test/badep\ncc -o parentbin m.c\nbin: parentbin\n' > "$DP/.clone-recipe"
+commit "$DP"
+grepout "failed dep triggers rollback"    "rolling back|rolled back" clone install test/parentdep -y
+assert "parent NOT installed (dep failed)" bash -c '! test -e "$CLONE_BIN/parentbin"'
+assert "good dep rolled back to cloned"    bash -c 'clone info test/goodep 2>&1 | grep -E "^  state" | grep -qi cloned'
+
+# ════════════════════════════════════════════════════════════════════
+hdr "49. uv tool python install (if uv present)"
+if command -v uv >/dev/null 2>&1; then
+  export UV_TOOL_DIR="$SBOX/uvtools"   # sandbox uv's tool venvs — never touch real ones
+  seed test/pytool; D="$CLONE_ROOT/test/pytool"
+  mkdir -p "$D/pytool"; printf 'def main():\n    print("pytool ok")\n' > "$D/pytool/__init__.py"
+  cat > "$D/pyproject.toml" <<'TOML'
+[project]
+name = "clone-test-pytool"
+version = "0.0.1"
+[project.scripts]
+clone-test-pytool = "pytool:main"
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+[tool.hatch.build.targets.wheel]
+packages = ["pytool"]
+TOML
+  commit "$D"
+  clone install test/pytool -y >/dev/null 2>&1
+  if [ -e "$CLONE_BIN/clone-test-pytool" ]; then
+    assert "uv tool installed the python CLI" bash -c '"$CLONE_BIN/clone-test-pytool" | grep -q "pytool ok"'
+    clone uninstall test/pytool >/dev/null 2>&1
+    assert "uv tool uninstall removed the bin" bash -c '! test -e "$CLONE_BIN/clone-test-pytool"'
+  else
+    ok "uv tool build backend unavailable (offline?) — soft skip"
+  fi
+  unset UV_TOOL_DIR
+else
+  ok "uv not installed — skipping uv tool test"
+fi
+
+# ════════════════════════════════════════════════════════════════════
 hdr "RESULTS"
 printf '\n  \033[32mPASS=%d\033[0m  \033[31mFAIL=%d\033[0m\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then

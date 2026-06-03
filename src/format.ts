@@ -392,6 +392,7 @@ export function printRepoInfo(repo: RepoEntry) {
         (repo.installed_at ? chalk.dim(`  ${repo.installed_at.slice(0, 10)}`) : "")
     );
   }
+  if (repo.pinned_ref) row("pinned", chalk.magenta(repo.pinned_ref) + chalk.dim("  (held; update skips it)"));
   if (artifacts.length) {
     row("binaries", artifacts.map((a) => chalk.green(a)).join(`\n${indent}${" ".repeat(11)}`));
   }
