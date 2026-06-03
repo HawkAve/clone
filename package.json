@@ -1,6 +1,6 @@
 {
   "name": "@nxac/clone",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Git repository package manager — clone, index, search, build/install, and organize GitHub repos like pacman + paru manage packages.",
   "type": "module",
   "bin": {
