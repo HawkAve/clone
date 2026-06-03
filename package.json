@@ -1,10 +1,21 @@
 {
   "name": "@nxac/clone",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Git repository package manager — clone, index, search, build/install, and organize GitHub repos like pacman + paru manage packages.",
   "type": "module",
   "bin": {
     "clone": "dist/index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HawkAve/clone.git"
+  },
+  "homepage": "https://github.com/HawkAve/clone#readme",
+  "bugs": {
+    "url": "https://github.com/HawkAve/clone/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "tsc",
@@ -29,10 +40,11 @@
   "author": "HawkAve",
   "license": "MIT",
   "files": [
-    "dist",
+    "dist/**/*.js",
     "completions",
-    "scripts",
-    "README.md"
+    "scripts/postinstall.sh",
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=18"
