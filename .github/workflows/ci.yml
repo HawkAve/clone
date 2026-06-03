@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      # gcc/make/cmake/cargo are preinstalled on ubuntu-latest runners; print
+      # versions so a missing toolchain is obvious in the log.
+      - name: Toolchain versions
+        run: |
+          set +e
+          for t in git cc make cmake cargo node npm; do
+            printf '%-6s ' "$t"; command -v "$t" >/dev/null && $t --version 2>/dev/null | head -1 || echo "(missing)"
+          done
+
+      - run: npm ci
+
+      - name: Build + self-test (73+ assertions, fully sandboxed)
+        env:
+          # Raises the GitHub API rate limit for the network sections.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm test

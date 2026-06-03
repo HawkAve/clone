@@ -1,0 +1,12 @@
+# Build output (rebuilt by `npm run build` / prepublishOnly)
+dist/
+node_modules/
+
+# Logs / scratch
+*.log
+
+# Local state from OTHER tools that happen to live in this dir — never publish/push.
+# (HUD/session caches contain machine paths, session IDs and cost data.)
+.omc/
+entities.json
+mempalace.yaml

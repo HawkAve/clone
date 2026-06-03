@@ -1,0 +1,52 @@
+{
+  "name": "@nxac/clone",
+  "version": "0.2.0",
+  "description": "Git repository package manager — clone, index, search, build/install, and organize GitHub repos like pacman + paru manage packages.",
+  "type": "module",
+  "bin": {
+    "clone": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "pretest": "npm run build",
+    "test": "bash scripts/selftest.sh",
+    "postinstall": "sh ./scripts/postinstall.sh",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "git",
+    "github",
+    "clone",
+    "repository",
+    "manager",
+    "package-manager",
+    "build-from-source",
+    "trending",
+    "cli"
+  ],
+  "author": "HawkAve",
+  "license": "MIT",
+  "files": [
+    "dist",
+    "completions",
+    "scripts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "commander": "^13.1.0",
+    "octokit": "^4.1.2",
+    "sql.js": "^1.14.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@types/sql.js": "^1.4.11",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3"
+  }
+}
