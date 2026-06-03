@@ -9,14 +9,19 @@ set -u
 
 # Resolve the CLI relative to this script so it works anywhere (CI checkout, etc.).
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CLI="$REPO_DIR/dist/index.js"
+export CLI="$REPO_DIR/dist/index.js"
 export SBOX="${SBOX:-${TMPDIR:-/tmp}/clone-selftest}"
 export CLONE_ROOT="$SBOX/root"
 export CLONE_BIN="$SBOX/bin"
 export CLONE_DATA="$SBOX/data"
 
 rm -rf "$SBOX"; mkdir -p "$CLONE_ROOT" "$CLONE_BIN" "$CLONE_DATA"
+# `clone` is a function wrapping the built CLI. Many assertions invoke it inside
+# `bash -c '…'` subshells, which DON'T inherit shell functions — export it (and
+# CLI) so those subshells resolve it too. Without this the suite only passes on a
+# machine that already has a global `clone` on PATH (e.g. a dev box); CI doesn't.
 clone(){ node "$CLI" "$@"; }
+export -f clone
 
 PASS=0; FAIL=0; declare -a FAILED=()
 hdr(){ printf '\n\033[1;36m════════ %s ════════\033[0m\n' "$*"; }
