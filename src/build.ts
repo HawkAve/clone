@@ -110,10 +110,14 @@ export function buildRepo(
     }
   }
 
-  // Prefer declared bins; fall back to discovered. Dedupe by resolved path.
-  const merged = [...declared.filter((b) => existsSync(b.path)), ...discovered];
+  // Declared bins (npm "bin" field, recipe `bin:` lines) are AUTHORITATIVE: when
+  // a package says what its binary is, link only that. Discovery (snapshot-diff)
+  // is the fallback for builds that declare nothing — it must never sweep in
+  // dependency CLIs that `npm install` drops into node_modules/.bin (tsc, etc.).
+  const usableDeclared = declared.filter((b) => existsSync(b.path));
+  const chosen = usableDeclared.length ? usableDeclared : discovered;
   const seen = new Set<string>();
-  const producedBinaries = merged.filter((b) => {
+  const producedBinaries = chosen.filter((b) => {
     if (seen.has(b.path)) return false;
     seen.add(b.path);
     return true;

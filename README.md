@@ -77,6 +77,8 @@ clone outdated --update       # update (and rebuild) all outdated repos
 clone outdated --ignore a/b,c/d   # skip some repos (adds to config ignore list)
 clone check                   # verify installed repos: dir, binaries, git health (pacman -Qk)
 clone check --source          # audit the source tree: build artifacts, in-place apps/services, moved repos
+clone check --build           # audit the build tree: clone-tracked vs redundant (has source clone) vs orphan
+clone doctor                  # full health check: integrity + source + build + lifecycle, one unified verdict
 clone reason owner/repo --explicit   # protect from orphan cleanup (pacman -D --asexplicit)
 clone reason owner/repo --asdeps     # mark as a dependency (orphan-eligible)
 clone changelog owner/repo    # commits landed upstream since you installed it (pacman -Qc)
@@ -90,7 +92,11 @@ clone remove owner/repo -s    # also remove deps pulled in only by this repo (li
 clone orphans                 # repos installed as deps that nothing needs now (like -Qdt)
 clone orphans --remove        # remove them
 clone clean                   # prune broken bin symlinks + dangling index entries (hints at _duplicates)
-clone clean --builds --cache  # also remove build dirs from non-installed repos + clear trending cache
+clone clean --builds --cache  # also remove build worktrees under build/ + clear trending cache
+clone clean --source          # delete regenerable build artifacts from source (node_modules/dist/…); skips committed dirs
+clone clean --source --dry-run  # preview what would be reclaimed, delete nothing
+clone clean --source owner/repo # scope to one (or more) repos instead of the whole tree
+clone clean --source --backup ~/bak  # MOVE artifacts to ~/bak (reversible) instead of deleting
 clone clean --duplicates      # delete the redundant copies set aside in _duplicates/ (pacman -Sc)
 clone log                     # trending history
 clone log owner/repo
@@ -217,8 +223,45 @@ $ clone check --source
 It flags three kinds of drift: **build artifacts** (`target/`, `node_modules/`, `build/`,
 `dist/`, `__pycache__/`, … — `vendor/` is *not* flagged, since Go vendoring is legitimately
 committed), **in-place apps/services** (a `venv/` or a path referenced by a systemd user unit),
-and **moved/deleted** repos still in the index. Cleaning is left to you (or `clone reindex`
-for the index) — the audit only tells you the truth.
+and **moved/deleted** repos still in the index.
+
+Crucially, it only counts artifacts git treats as **regenerable output** — a `build/` or
+`dist/` dir that's *committed source* (e.g. vscode's tracked `build/` tooling) is left alone
+and noted separately, never reported as pollution. Then it points you at the fix:
+
+```
+clone clean --source            # delete the regenerable artifacts (frees the ~3.3G), confirm first
+clone clean --source --dry-run  # preview only
+clone adopt --app <path> --with-source   # relocate an in-place app to build/ and track it
+```
+
+**`clone clean --source` is safe by construction**: it deletes a dir only when git tracks *no
+files* under it (so it can be rebuilt), and it skips repos tracked as apps. A committed
+`build/`/`dist/` is never removed. As always, it shows the list + total and asks before
+deleting (or `--dry-run` to just look, `-y` to skip the prompt). Pass repo names to scope it to
+specific repos, or `--backup <dir>` to **move** the artifacts into a backup tree (instant on the
+same filesystem, fully reversible) instead of deleting — verify everything still builds, then
+delete the backup to reclaim the space.
+
+The proper end state for, say, an npm tool is reached with two steps — `clone clean --source`
+(sweep the misplaced output) then `clone install owner/repo` (rebuild it in a `build/` worktree
+and link the binary). The source stays pristine; the rebuilt `node_modules` lives under `build/`;
+only the package's *declared* binary is linked (dependency CLIs in `node_modules/.bin` are never
+swept onto your PATH).
+
+**Auditing `build/` — `clone check --build`.** The mirror of `check --source`, for the other
+tree. It classifies every `build/` dir as **tracked** (clone-managed: an install or an `adopt
+--app`), **redundant** (a flat dir that duplicates a pristine `source/` clone — rebuildable on
+demand, so reclaimable), or **orphan** (no `source/` clone — the only copy here). It flags `venv`
+and unique `.env` state so you don't reclaim something with config in it. Read-only — it reports
+the drift; you reclaim redundant dirs (rebuild from `source/` later) or `clone adopt` orphans.
+
+**`clone doctor` — the whole physical.** `check` is three focused, scriptable modes; `doctor`
+runs them all at once (installed/app **integrity** + `source/` **purity** + `build/` **audit** +
+**lifecycle** health: failed builds, orphaned deps) and ends with a single verdict — either
+"✓ Everything healthy" or a numbered list of issues, each with the exact command to fix it
+(`clone clean --source`, `clone adopt --app …`, `clone reindex`, `clone orphans --remove`, …) and
+the total reclaimable space. The `brew doctor` / `rustup check` of clone.
 
 **Tracking apps/services — `clone adopt --app`.** Some repos aren't CLI tools you put on
 PATH — they're apps you *run in place* (a FastAPI service with a `venv/`, a daemon behind a
@@ -256,6 +299,11 @@ but copies **only committed content** — your `venv/`, `data/`, and `logs/` sta
 instance and never pollute the mirror — then repoints `origin` at upstream so `git pull` tracks
 GitHub. The index `path` becomes the pristine mirror (so `clone check --source` sees it clean)
 while `build_path` stays the running instance (shown as `running` in `clone info`).
+
+If the app you point at is **still inside `source/`** (you built/ran it there by mistake),
+`--with-source` *relocates* it in one step: it moves the running instance (venv and all) to
+`build/owner/repo`, then restores a pristine `source/owner/repo` clone. Preview with `--dry-run`
+first; if a systemd unit points at the old path it warns you to repoint + restart it.
 
 ## Dependencies & orphans
 

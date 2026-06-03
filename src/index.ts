@@ -17,7 +17,7 @@ import {
   readlinkSync,
   cpSync,
 } from "fs";
-import { join, dirname, resolve, basename } from "path";
+import { join, dirname, resolve, basename, relative } from "path";
 import { homedir } from "os";
 import { execSync, execFileSync } from "child_process";
 import { createInterface } from "readline";
@@ -1865,6 +1865,9 @@ async function cmdClean(
     cache?: boolean;
     builds?: boolean;
     duplicates?: boolean;
+    source?: boolean;
+    repos?: string[];
+    backup?: string;
     dryRun?: boolean;
     yes?: boolean;
   } = {}
@@ -1933,6 +1936,33 @@ async function cmdClean(
     }
   }
 
+  // 3b. Regenerable build artifacts polluting the pristine source tree
+  //     (node_modules/target/dist/...). SAFE: only dirs git tracks no files
+  //     under — a committed build/ (e.g. vscode's) is never touched.
+  const sourceArtifacts: { repo: string; dir: string; size: string; bytes: number }[] = [];
+  let sourceArtifactBytes = 0;
+  if (opts.source) {
+    // Optional scope: only the named repos (so a demo/targeted clean is possible).
+    const want =
+      opts.repos && opts.repos.length
+        ? new Set(opts.repos.map((r) => parseGitHubUrl(r) ?? r))
+        : null;
+    for (const e of db.list({})) {
+      if (!e.path.startsWith(config.baseDir + "/") || !existsSync(e.path)) continue;
+      if (e.install_state === "app") continue; // an app's tree is its own business
+      if (want && !want.has(e.id)) continue;
+      for (const a of scanArtifacts(e.path).regen) {
+        sourceArtifacts.push({
+          repo: e.id,
+          dir: join(e.path, a.dir),
+          size: humanSize(a.bytes),
+          bytes: a.bytes,
+        });
+        sourceArtifactBytes += a.bytes;
+      }
+    }
+  }
+
   // 4. Redundant copies set aside in _duplicates/ (the dedup holding pen) — the
   //    `pacman -Sc` analogue. Only cleared with the explicit --duplicates flag.
   const dupDir = join(config.baseDir, "_duplicates");
@@ -1943,6 +1973,12 @@ async function cmdClean(
   console.log(`  dangling index entries: ${dangling.length}`);
   if (opts.builds)
     console.log(`  build worktrees:        ${buildDirs.length}`);
+  if (opts.source)
+    console.log(
+      `  source artifacts:       ${sourceArtifacts.length}  ${chalk.dim(
+        sourceArtifacts.length ? humanSize(sourceArtifactBytes) : ""
+      )}` + (opts.backup && sourceArtifacts.length ? chalk.dim(`  → backup: ${opts.backup}`) : "")
+    );
   if (opts.cache) console.log(`  trending cache:         (will clear)`);
   if (opts.duplicates) {
     console.log(
@@ -1960,6 +1996,7 @@ async function cmdClean(
     !brokenLinks.length &&
     !dangling.length &&
     (!opts.builds || !buildDirs.length) &&
+    (!opts.source || !sourceArtifacts.length) &&
     (!opts.duplicates || !dupItems.length) &&
     !opts.cache;
   if (nothing) {
@@ -1969,6 +2006,11 @@ async function cmdClean(
   if (opts.builds && buildDirs.length) {
     for (const b of buildDirs)
       console.log(chalk.dim(`    ${b.size}\t${b.dir}`));
+  }
+  if (opts.source && sourceArtifacts.length) {
+    sourceArtifacts.sort((a, b) => b.bytes - a.bytes);
+    for (const a of sourceArtifacts)
+      console.log(chalk.dim(`    ${a.size}\t${a.repo}/${basename(a.dir)}`));
   }
 
   if (opts.dryRun) {
@@ -2001,6 +2043,20 @@ async function cmdClean(
       actions++;
     }
   }
+  if (opts.source) {
+    for (const a of sourceArtifacts) {
+      if (opts.backup) {
+        // Reversible: relocate (don't delete) into the backup tree, preserving
+        // owner/repo/<artifact> structure so it's obvious how to restore.
+        const dest = join(opts.backup, relative(config.baseDir, a.dir));
+        mkdirSync(dirname(dest), { recursive: true });
+        moveDir(a.dir, dest);
+      } else {
+        rmSync(a.dir, { recursive: true, force: true });
+      }
+      actions++;
+    }
+  }
   if (opts.duplicates) {
     for (const d of dupItems) {
       rmSync(join(dupDir, d), { recursive: true, force: true });
@@ -2022,6 +2078,14 @@ async function cmdClean(
     }
   }
   console.log(chalk.green(`\n  Cleaned (${actions} action${actions === 1 ? "" : "s"}).`));
+  if (opts.backup && opts.source && sourceArtifacts.length) {
+    console.log(
+      chalk.dim(
+        `  Source artifacts moved to ${opts.backup} (not deleted). ` +
+          `Verify things still build/run, then delete it to reclaim the space.`
+      )
+    );
+  }
 }
 
 async function cmdOrphans(opts: { remove?: boolean; yes?: boolean } = {}) {
@@ -2114,6 +2178,40 @@ function humanSize(bytes: number): string {
   return `${n >= 10 || i === 0 ? Math.round(n) : n.toFixed(1)}${u[i]}`;
 }
 
+// An artifact dir is safe to delete ONLY if git tracks no files under it — i.e.
+// it's build output, not committed source. This is the critical guard: some
+// repos genuinely commit a build/ or dist/ dir (e.g. vscode's build/ tooling),
+// and deleting those would destroy real content. If git can't answer, we keep it.
+function isRegenerableArtifact(repoPath: string, dir: string): boolean {
+  try {
+    const out = execSync(
+      `git -C ${JSON.stringify(repoPath)} ls-files -- ${JSON.stringify(dir)}`,
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 10000 }
+    );
+    return out.trim() === "";
+  } catch {
+    return false; // be conservative — never delete what git won't vouch for
+  }
+}
+
+// All regenerable (untracked) build-artifact dirs in a repo, with sizes. Shared
+// by `check --source` (report) and `clean --source` (delete). 'committed' lists
+// artifact dirs that ARE tracked source — flagged so we can leave them alone.
+function scanArtifacts(repoPath: string): {
+  regen: { dir: string; bytes: number }[];
+  committed: string[];
+} {
+  const regen: { dir: string; bytes: number }[] = [];
+  const committed: string[] = [];
+  for (const d of ARTIFACT_DIRS) {
+    const p = join(repoPath, d);
+    if (!existsSync(p)) continue;
+    if (isRegenerableArtifact(repoPath, d)) regen.push({ dir: d, bytes: duBytes(p) });
+    else committed.push(d);
+  }
+  return { regen, committed };
+}
+
 // Paths referenced by any systemd *user* unit (WorkingDirectory/ExecStart/...),
 // so we can flag a repo that's actively running as a service in place.
 function systemdReferencedPaths(): string[] {
@@ -2195,33 +2293,66 @@ async function registerApp(
   const id = (remote && ownerRepoFromRemote(remote)) || `local/${basename(p)}`;
   const svc = serviceForPath(p);
 
-  // The running instance is always the build_path; the index `path` is the
-  // pristine source mirror when --with-source, otherwise the instance itself.
-  const buildPath = p;
-  const sourceDest = join(config.baseDir, id);
-  const wantSource = !!opts.withSource;
+  // The running instance is the build_path; the index `path` is the pristine
+  // source mirror when --with-source, otherwise the instance itself.
+  let buildPath = p;
   let sourcePath = p;
+  const sourceDest = join(config.baseDir, id);
+  const instanceDest = join(config.buildDir, id);
+  const wantSource = !!opts.withSource;
+  const originUrl = fromRemote ? `https://github.com/${id}.git` : remote ?? undefined;
+  // The app was built IN source/ by mistake → relocate it to build/ and restore
+  // a pristine source/ clone. This is the one-command fix for that drift.
+  const inSource = p === config.baseDir || p.startsWith(config.baseDir + "/");
+  const relocate = wantSource && inSource;
 
   if (opts.dryRun) {
-    console.log(chalk.dim(`would track app ${id} (running at ${p})`));
-    if (wantSource) {
-      console.log(
-        chalk.dim(
-          existsSync(sourceDest)
-            ? `  source mirror already present at ${sourceDest}`
-            : `  would clone a pristine source mirror to ${sourceDest}`
-        )
-      );
+    if (relocate) {
+      console.log(chalk.dim(`would relocate app ${id}:`));
+      console.log(chalk.dim(`  move running instance  ${p} → ${instanceDest}`));
+      console.log(chalk.dim(`  restore pristine source → ${sourceDest}`));
+    } else {
+      console.log(chalk.dim(`would track app ${id} (running at ${p})`));
+      if (wantSource)
+        console.log(
+          chalk.dim(
+            existsSync(sourceDest)
+              ? `  source mirror already present at ${sourceDest}`
+              : `  would clone a pristine source mirror to ${sourceDest}`
+          )
+        );
     }
     if (svc) console.log(chalk.dim(`  service: ${svc}`));
     return;
   }
 
-  if (wantSource) {
+  if (relocate) {
+    if (existsSync(instanceDest)) {
+      console.error(chalk.red(`Already something at ${instanceDest}.`));
+      console.error(chalk.dim(`  Move/remove it first, or pass the instance path under build/ directly.`));
+      process.exit(1);
+    }
+    if (svc && serviceActive(svc) === "active") {
+      console.log(
+        chalk.yellow(`  ⚠ ${svc} is running — update its unit path to the new location and restart after this.`)
+      );
+    }
+    console.log(chalk.cyan(`Relocating ${id}: instance → build/, restoring pristine source/…`));
+    mkdirSync(dirname(instanceDest), { recursive: true });
+    moveDir(p, instanceDest); // the whole app (venv/data/logs) moves to build/
+    buildPath = instanceDest;
+    mkdirSync(dirname(sourceDest), { recursive: true });
+    if (gitCloneLocal(instanceDest, sourceDest, originUrl)) {
+      sourcePath = sourceDest;
+    } else {
+      console.error(chalk.yellow(`  Couldn't restore pristine source — index path points at the moved instance.`));
+      sourcePath = instanceDest;
+    }
+    try { rmdirSync(dirname(p)); } catch { /* owner dir not empty — leave it */ }
+  } else if (wantSource) {
     if (existsSync(sourceDest)) {
       sourcePath = sourceDest; // already mirrored — reuse it
     } else {
-      const originUrl = fromRemote ? `https://github.com/${id}.git` : remote ?? undefined;
       console.log(chalk.cyan(`Cloning pristine source mirror → ${sourceDest}`));
       mkdirSync(dirname(sourceDest), { recursive: true });
       if (gitCloneLocal(p, sourceDest, originUrl)) {
@@ -2265,12 +2396,13 @@ async function cmdCheckSource() {
   const repos = db.list({}).filter((r) => r.path.startsWith(config.baseDir + "/"));
   if (repos.length === 0) {
     console.log("No source repos indexed.");
-    return;
+    return { dirty: 0, apps: 0, moved: 0, reclaimable: 0 };
   }
   const unitPaths = systemdReferencedPaths();
 
   let pristine = 0;
   let reclaimable = 0;
+  let committedDirs = 0; // tracked build/dist dirs left alone (not pollution)
   const dirty: { id: string; arts: string[]; bytes: number }[] = [];
   const apps: { id: string; why: string }[] = [];
   const moved: string[] = [];
@@ -2280,15 +2412,9 @@ async function cmdCheckSource() {
       moved.push(repo.id); // indexed under source but gone (moved to build/, deleted, …)
       continue;
     }
-    const arts: string[] = [];
-    let bytes = 0;
-    for (const d of ARTIFACT_DIRS) {
-      const p = join(repo.path, d);
-      if (existsSync(p)) {
-        arts.push(d);
-        bytes += duBytes(p);
-      }
-    }
+    const { regen, committed } = scanArtifacts(repo.path);
+    committedDirs += committed.length;
+    const bytes = regen.reduce((s, a) => s + a.bytes, 0);
     const hasVenv = VENV_DIRS.some((v) =>
       existsSync(join(repo.path, v, "bin", "python"))
     );
@@ -2302,8 +2428,8 @@ async function cmdCheckSource() {
         why: isService ? "running as a systemd service" : "has a virtualenv",
       });
     }
-    if (arts.length) {
-      dirty.push({ id: repo.id, arts, bytes });
+    if (regen.length) {
+      dirty.push({ id: repo.id, arts: regen.map((a) => a.dir), bytes });
       reclaimable += bytes;
     } else if (!isService && !hasVenv) {
       pristine++;
@@ -2340,19 +2466,143 @@ async function cmdCheckSource() {
       `${chalk.magenta(`${apps.length} app/service`)} · ` +
       `${chalk.red(`${moved.length} missing`)}  (of ${repos.length} source repos)`
   );
+  if (committedDirs > 0) {
+    console.log(
+      chalk.dim(
+        `  (${committedDirs} build/dist dir(s) are committed source — left alone, not counted.)`
+      )
+    );
+  }
+  // Concrete remediation, so the audit isn't a dead end.
   if (reclaimable > 0) {
     console.log(
       chalk.dim(
-        `  ~${humanSize(reclaimable)} of build artifacts in source. ` +
-          `These regenerate on build — safe to delete from the pristine tree.`
+        `  ~${humanSize(reclaimable)} of regenerable artifacts. ` +
+          `Reclaim with ${chalk.bold("clone clean --source")} (safe: skips committed dirs).`
+      )
+    );
+  }
+  if (apps.length) {
+    console.log(
+      chalk.dim(
+        `  Move an app to build/ and track it: ${chalk.bold("clone adopt --app <path> --with-source")}.`
       )
     );
   }
   if (dirty.length || apps.length || moved.length) process.exitCode = 1;
+  return { dirty: dirty.length, apps: apps.length, moved: moved.length, reclaimable };
 }
 
-async function cmdCheck(target?: string, opts: { all?: boolean; source?: boolean } = {}) {
-  if (opts.source) return cmdCheckSource();
+// Audit the build/ tree (clone check --build): which dirs clone properly tracks
+// vs leftover manual builds — redundant (a pristine source/ clone exists, so
+// they rebuild on demand) or orphan (no source clone — the only copy). Read-only.
+async function cmdCheckBuild() {
+  const buildDir = config.buildDir;
+  let entries: string[];
+  try {
+    entries = readdirSync(buildDir).filter((n) => {
+      try { return statSync(join(buildDir, n)).isDirectory(); } catch { return false; }
+    });
+  } catch {
+    console.log("No build directory yet.");
+    return { tracked: 0, redundant: 0, orphan: 0, reclaimable: 0 };
+  }
+  if (entries.length === 0) {
+    console.log("Build directory is empty.");
+    return { tracked: 0, redundant: 0, orphan: 0, reclaimable: 0 };
+  }
+
+  // Top-level build/ segment of each tracked build_path → the repos clone owns there.
+  const trackedTops = new Map<string, string[]>();
+  // Source repo basenames, to spot a flat build dir that duplicates a clone.
+  const sourceNames = new Set<string>();
+  for (const e of db.list({})) {
+    if (e.build_path && e.build_path.startsWith(buildDir + "/")) {
+      const top = relative(buildDir, e.build_path).split("/")[0];
+      (trackedTops.get(top) ?? trackedTops.set(top, []).get(top)!).push(e.id);
+    }
+    if (e.path.startsWith(config.baseDir + "/")) sourceNames.add(e.id.split("/").pop()!);
+  }
+
+  const tracked: string[] = [];
+  const redundant: { name: string; size: string; bytes: number; note: string }[] = [];
+  const orphan: { name: string; size: string; bytes: number; note: string }[] = [];
+
+  for (const name of entries) {
+    if (trackedTops.has(name)) {
+      tracked.push(...trackedTops.get(name)!);
+      continue;
+    }
+    const p = join(buildDir, name);
+    const bytes = duBytes(p);
+    const venv =
+      existsSync(join(p, "venv", "bin", "python")) || existsSync(join(p, ".venv", "bin", "python"));
+    const note = [venv ? "venv" : "", existsSync(join(p, ".env")) ? "has .env" : ""]
+      .filter(Boolean)
+      .join(", ");
+    const rec = { name, size: humanSize(bytes), bytes, note };
+    if (sourceNames.has(name)) redundant.push(rec);
+    else orphan.push(rec);
+  }
+
+  if (tracked.length) {
+    console.log(chalk.bold("\n  Tracked (clone-managed):"));
+    for (const id of tracked.sort()) console.log(`    ${chalk.green("▣")} ${id}`);
+  }
+  let reclaimable = 0;
+  if (redundant.length) {
+    console.log(chalk.bold("\n  Redundant build dirs (a pristine source/ clone exists — rebuildable):"));
+    redundant.sort((a, b) => b.bytes - a.bytes);
+    for (const r of redundant) {
+      reclaimable += r.bytes;
+      console.log(`    ${chalk.yellow("◐")} ${r.name} ${chalk.dim(`— ${r.size}${r.note ? ` (${r.note})` : ""}`)}`);
+    }
+  }
+  if (orphan.length) {
+    console.log(chalk.bold("\n  Orphan build dirs (no source/ clone — this is the only copy):"));
+    orphan.sort((a, b) => b.bytes - a.bytes);
+    for (const o of orphan) {
+      console.log(`    ${chalk.red("✗")} ${o.name} ${chalk.dim(`— ${o.size}${o.note ? ` (${o.note})` : ""}`)}`);
+    }
+  }
+
+  console.log();
+  console.log(
+    `  ${chalk.green(`${tracked.length} tracked`)} · ` +
+      `${chalk.yellow(`${redundant.length} redundant`)} · ` +
+      `${chalk.red(`${orphan.length} orphan`)}  (of ${entries.length} build dirs)`
+  );
+  if (reclaimable > 0) {
+    console.log(
+      chalk.dim(
+        `  ~${humanSize(reclaimable)} in redundant builds — each duplicates a source/ clone. ` +
+          `Rebuild on demand (clone install / adopt --app --with-source); back up before removing.`
+      )
+    );
+  }
+  if (orphan.length) {
+    console.log(
+      chalk.dim(`  Orphans have no source clone — 'clone adopt' to track one, or preserve before removing.`)
+    );
+  }
+  if (redundant.length || orphan.length) process.exitCode = 1;
+  return { tracked: tracked.length, redundant: redundant.length, orphan: orphan.length, reclaimable };
+}
+
+async function cmdCheck(
+  target?: string,
+  opts: { all?: boolean; source?: boolean; build?: boolean } = {}
+) {
+  if (opts.source) return void (await cmdCheckSource());
+  if (opts.build) return void (await cmdCheckBuild());
+  await cmdCheckIntegrity(target, opts);
+}
+
+// Verify installed/built/app repos are intact: dir, binaries, git, service.
+async function cmdCheckIntegrity(
+  target?: string,
+  opts: { all?: boolean } = {}
+): Promise<{ problems: number; total: number }> {
   let repos: RepoEntry[];
   if (target) {
     const e = db.get(parseGitHubUrl(target) ?? target);
@@ -2375,7 +2625,7 @@ async function cmdCheck(target?: string, opts: { all?: boolean; source?: boolean
     console.log(
       opts.all ? "No repos indexed." : "No installed repos. Use --all to check everything."
     );
-    return;
+    return { problems: 0, total: 0 };
   }
 
   let problems = 0;
@@ -2410,6 +2660,57 @@ async function cmdCheck(target?: string, opts: { all?: boolean; source?: boolean
       : chalk.yellow(`\n  ${problems} of ${repos.length} repo(s) have problems.`)
   );
   if (problems > 0) process.exitCode = 1;
+  return { problems, total: repos.length };
+}
+
+// One command, the whole physical: runs every health check (integrity + source
+// purity + build tree + lifecycle) and prints a unified verdict with the top
+// remediations. The `brew doctor` / `rustup check` of clone.
+async function cmdDoctor() {
+  console.log(chalk.bold.cyan("clone doctor — full health check"));
+
+  console.log(chalk.bold("\n● Installed / app integrity"));
+  const integ = await cmdCheckIntegrity(undefined, {});
+
+  console.log(chalk.bold("\n● Source tree purity"));
+  const src = await cmdCheckSource();
+
+  console.log(chalk.bold("\n● Build tree"));
+  const bld = await cmdCheckBuild();
+
+  console.log(chalk.bold("\n● Lifecycle"));
+  const failed = db.list({}).filter((e) => e.install_state === "failed");
+  const orphans = db.orphans();
+  console.log(
+    `  failed builds: ${failed.length}` +
+      (failed.length ? chalk.dim(` — ${failed.map((f) => f.id).join(", ")}`) : "")
+  );
+  console.log(
+    `  orphaned deps: ${orphans.length}` +
+      (orphans.length ? chalk.dim(` — ${orphans.map((o) => o.id).join(", ")}`) : "")
+  );
+
+  // Unified verdict + the specific next command for each kind of issue.
+  const reclaimable = src.reclaimable + bld.reclaimable;
+  const issues: string[] = [];
+  if (integ.problems) issues.push(`${integ.problems} broken install(s) — see integrity section above`);
+  if (src.dirty) issues.push(`${src.dirty} source repo(s) with build artifacts — ${chalk.bold("clone clean --source")}`);
+  if (src.apps) issues.push(`${src.apps} in-place app(s) in source — ${chalk.bold("clone adopt --app <path> --with-source")}`);
+  if (src.moved) issues.push(`${src.moved} indexed-but-missing — ${chalk.bold("clone reindex")}`);
+  if (bld.redundant) issues.push(`${bld.redundant} redundant build dir(s) — rebuild from source, then reclaim`);
+  if (bld.orphan) issues.push(`${bld.orphan} orphan build dir(s) — ${chalk.bold("clone adopt")} or preserve`);
+  if (failed.length) issues.push(`${failed.length} failed build(s) — ${chalk.bold("clone install --force <repo>")}`);
+  if (orphans.length) issues.push(`${orphans.length} orphaned dep(s) — ${chalk.bold("clone orphans --remove")}`);
+
+  console.log(chalk.bold("\n══ summary ══"));
+  if (issues.length === 0) {
+    console.log(chalk.green("  ✓ Everything healthy — source pristine, build tracked, installs intact."));
+  } else {
+    console.log(chalk.yellow(`  ${issues.length} area(s) to look at:`));
+    for (const i of issues) console.log(`    • ${i}`);
+    if (reclaimable > 0) console.log(chalk.dim(`    ~${humanSize(reclaimable)} reclaimable.`));
+    process.exitCode = 1;
+  }
 }
 
 // Which indexed repo owns a filesystem path (pacman -Qo).
@@ -3243,7 +3544,13 @@ program
   .description("Verify installed repos are intact: dir, binaries, git health (like pacman -Qk)")
   .option("-a, --all", "Check every cloned repo (default: only installed/built)")
   .option("--source", "Audit the source tree for purity: build artifacts, in-place apps/services")
-  .action((repo, opts) => cmdCheck(repo, { all: opts.all, source: opts.source }));
+  .option("--build", "Audit the build/ tree: clone-tracked vs redundant (has source clone) vs orphan")
+  .action((repo, opts) => cmdCheck(repo, { all: opts.all, source: opts.source, build: opts.build }));
+
+program
+  .command("doctor")
+  .description("Full health check: integrity + source purity + build tree + lifecycle, with a unified verdict")
+  .action(() => cmdDoctor());
 
 program
   .command("owns <path>")
@@ -3269,16 +3576,21 @@ program
   .action((opts) => cmdOrphans({ remove: opts.remove, yes: opts.yes }));
 
 program
-  .command("clean")
+  .command("clean [repos...]")
   .description("Prune broken bin symlinks, dangling index entries, caches (like pacman -Sc)")
-  .option("--builds", "Also remove build-artifact dirs (target/build/node_modules/...) from non-installed repos")
+  .option("--builds", "Also remove build worktrees under build/ not backing a live install")
+  .option("--source", "Also delete regenerable build artifacts (node_modules/target/dist/...) from source repos — skips committed dirs")
+  .option("--backup <dir>", "With --source: MOVE artifacts into <dir> (reversible) instead of deleting")
   .option("--cache", "Also clear the trending HTML cache")
   .option("--duplicates", "Also delete the redundant copies set aside in _duplicates/")
   .option("--dry-run", "Show what would be cleaned without removing")
   .option("-y, --yes", "Skip the confirmation prompt")
-  .action((opts) =>
+  .action((repos, opts) =>
     cmdClean({
       builds: opts.builds,
+      source: opts.source,
+      repos,
+      backup: opts.backup,
       cache: opts.cache,
       duplicates: opts.duplicates,
       dryRun: opts.dryRun,

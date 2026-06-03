@@ -358,8 +358,9 @@ export class CloneDB {
     const params: any[] = [];
 
     if (filters.installed) {
-      // "installed" in the user's sense = anything you've built or linked.
-      conditions.push("install_state IN ('installed', 'built')");
+      // "installed" in the user's sense = anything you've built, linked, or
+      // set up to run in place (a tracked app/service).
+      conditions.push("install_state IN ('installed', 'built', 'app')");
     }
 
     if (filters.language) {

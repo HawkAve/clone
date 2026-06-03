@@ -504,10 +504,13 @@ assert "recipe-driven binary still runs"    bash -c '"$CLONE_BIN/askme" | grep -
 
 # ════════════════════════════════════════════════════════════════════
 hdr "38. check --source (source-tree purity audit)"
-# A polluted repo: build artifacts in pristine source.
+# A polluted repo: regenerable build artifacts (gitignored, like a real repo) in
+# otherwise-pristine source. node_modules stays UNTRACKED so the audit flags it.
 seed test/polluted
 mkdir -p "$CLONE_ROOT/test/polluted/node_modules/foo"
 echo x > "$CLONE_ROOT/test/polluted/node_modules/foo/x"
+echo "node_modules/" > "$CLONE_ROOT/test/polluted/.gitignore"
+printf '{"name":"polluted"}\n' > "$CLONE_ROOT/test/polluted/package.json"
 commit "$CLONE_ROOT/test/polluted"
 # An app set up to run in place (has a venv).
 seed test/appy
@@ -560,6 +563,97 @@ assert "info shows the running instance (build/)" \
 # A with-source app is found by the normal source scan, so reindex keeps it too.
 clone reindex >/dev/null 2>&1
 assert "with-source app survives reindex"  bash -c 'clone info local/svc 2>&1 | grep -qi "app"'
+
+# Relocate an app mistakenly built/run IN source/ → move to build/, restore
+# pristine source/ — the one-command fix for that drift.
+INSRC="$CLONE_ROOT/grab/myapp"
+mkdir -p "$INSRC"; git -C "$INSRC" init -q
+echo "print('run')" > "$INSRC/app.py"
+git -C "$INSRC" add app.py && git -C "$INSRC" -c user.email=t@t -c user.name=t commit -qm app
+mkdir -p "$INSRC/venv/bin"; echo j > "$INSRC/venv/bin/python"   # untracked runtime
+grepout "relocate dry-run previews the move" "move running instance|Relocating" \
+  clone adopt --app "$INSRC" --with-source --dry-run
+assert "dry-run moved nothing"                test -d "$CLONE_ROOT/grab/myapp"
+grepout "relocate moves the app to build/"    "Relocating" clone adopt --app "$INSRC" --with-source
+assert "instance moved to build/ (venv came along)" test -e "$SBOX/build/local/myapp/venv/bin/python"
+assert "pristine source restored in source/"  test -f "$CLONE_ROOT/local/myapp/app.py"
+assert "restored source is pristine (no venv)" bash -c '! test -e "$CLONE_ROOT/local/myapp/venv"'
+assert "original in-source location is gone"  bash -c '! test -e "$CLONE_ROOT/grab/myapp"'
+assert "tracked as an app after relocate"     bash -c 'clone info local/myapp 2>&1 | grep -qi "app"'
+assert "tracked apps show under list --installed" bash -c 'clone list --installed 2>&1 | grep -q "local/myapp"'
+
+# ════════════════════════════════════════════════════════════════════
+hdr "40. clean --source (delete regenerable artifacts, keep committed ones)"
+seed test/polluted2
+D="$CLONE_ROOT/test/polluted2"
+mkdir -p "$D/node_modules/x"; echo junk > "$D/node_modules/x/f"   # untracked → regenerable
+mkdir -p "$D/build"; echo "real source" > "$D/build/tool.sh"      # COMMITTED → must survive
+git -C "$D" add build
+git -C "$D" -c user.email=t@t -c user.name=t commit -qm build
+grepout "check flags the regenerable node_modules" "test/polluted2.*node_modules" clone check --source
+assert "check does NOT flag the committed build/" \
+  bash -c '! clone check --source 2>&1 | grep "test/polluted2" | grep -q "build"'
+grepout "clean --source --dry-run lists it"  "node_modules" clone clean --source --dry-run
+assert "dry-run removed nothing"             test -d "$D/node_modules"
+clone clean --source -y >/dev/null 2>&1
+assert "regenerable node_modules deleted"    bash -c '! test -e "$D/node_modules"'
+assert "committed build/ preserved (no data loss)" test -f "$D/build/tool.sh"
+
+# ════════════════════════════════════════════════════════════════════
+hdr "41. npm links ONLY the declared bin, not dependency CLIs (regression)"
+# Bug found via the x-mcp demo: snapshot discovery swept node_modules/.bin/tsc etc.
+# onto PATH alongside the real bin. Declared bins must be authoritative.
+seed test/withdeps
+D="$CLONE_ROOT/test/withdeps"
+printf '{\n "name":"withdeps",\n "version":"1.0.0",\n "bin":{"withdeps":"cli.js"},\n "scripts":{"build":"node make-bin.js"}\n}\n' > "$D/package.json"
+printf '#!/usr/bin/env node\nconsole.log("withdeps ok");\n' > "$D/cli.js"
+# Simulate a dependency CLI landing in node_modules/.bin during the build.
+printf 'const fs=require("fs");fs.mkdirSync("node_modules/.bin",{recursive:true});fs.writeFileSync("node_modules/.bin/tsc","#!/bin/sh\\necho dep\\n");fs.chmodSync("node_modules/.bin/tsc",0o755);\n' > "$D/make-bin.js"
+commit "$D"
+clone install test/withdeps -y >/dev/null 2>&1
+assert "declared bin (withdeps) linked"        test -L "$CLONE_BIN/withdeps"
+assert "withdeps runs"                         bash -c '"$CLONE_BIN/withdeps" | grep -q "withdeps ok"'
+assert "dependency CLI (tsc) NOT linked"       bash -c '! test -e "$CLONE_BIN/tsc"'
+
+# ════════════════════════════════════════════════════════════════════
+hdr "42. clean --source --backup (move, not delete) + repo scope"
+seed test/bkup
+D="$CLONE_ROOT/test/bkup"
+mkdir -p "$D/node_modules/x"; echo j > "$D/node_modules/x/f"
+echo "node_modules/" > "$D/.gitignore"; printf '{"name":"bkup"}\n' > "$D/package.json"
+commit "$D"
+# Another polluted repo that must be UNTOUCHED when we scope to test/bkup.
+seed test/other
+mkdir -p "$CLONE_ROOT/test/other/node_modules/y"; echo j > "$CLONE_ROOT/test/other/node_modules/y/f"
+echo "node_modules/" > "$CLONE_ROOT/test/other/.gitignore"; printf '{"name":"other"}\n' > "$CLONE_ROOT/test/other/package.json"
+commit "$CLONE_ROOT/test/other"
+BK="$SBOX/artifact-backup"
+clone clean --source test/bkup --backup "$BK" -y >/dev/null 2>&1
+assert "scoped: target node_modules removed from source" bash -c '! test -e "$CLONE_ROOT/test/bkup/node_modules"'
+assert "backup holds the moved dir (reversible)"         test -f "$BK/test/bkup/node_modules/x/f"
+assert "scope respected: other repo untouched"           test -d "$CLONE_ROOT/test/other/node_modules"
+
+# ════════════════════════════════════════════════════════════════════
+hdr "43. check --build (audit the build/ tree)"
+# A flat build dir whose name matches a source repo → redundant (rebuildable).
+mkdir -p "$SBOX/build/cmaker"; echo x > "$SBOX/build/cmaker/f"
+# A flat build dir with no source twin → orphan (only copy).
+mkdir -p "$SBOX/build/zzz-orphan"; echo x > "$SBOX/build/zzz-orphan/f"
+grepout "check --build classifies the tree" "tracked|redundant|orphan" clone check --build
+assert "redundant flat dir (has source twin) detected" \
+  bash -c 'clone check --build 2>&1 | awk "/Redundant/{r=1} /Orphan/{r=0} r&&/cmaker/{ok=1} END{exit !ok}"'
+assert "orphan flat dir (no source twin) detected" \
+  bash -c 'clone check --build 2>&1 | awk "/Orphan/{o=1} o&&/zzz-orphan/{ok=1} END{exit !ok}"'
+assert "clone-tracked worktrees shown as tracked (not redundant)" \
+  bash -c 'clone check --build 2>&1 | awk "/Tracked/{t=1} /Redundant|Orphan/{t=0} t&&/nodetool/{ok=1} END{exit !ok}"'
+
+# ════════════════════════════════════════════════════════════════════
+hdr "44. doctor (unified health check)"
+grepout "doctor runs every section" "Installed / app integrity" clone doctor
+grepout "doctor includes source audit"  "Source tree" clone doctor
+grepout "doctor includes build audit"   "Build tree"  clone doctor
+grepout "doctor includes lifecycle"     "Lifecycle"   clone doctor
+grepout "doctor prints a unified verdict" "summary|healthy|look at" clone doctor
 
 # ════════════════════════════════════════════════════════════════════
 hdr "RESULTS"

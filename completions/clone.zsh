@@ -26,6 +26,7 @@ _clone() {
     'clean:Prune broken bin symlinks, dangling entries, caches'
     'reason:Set install reason (--explicit / --asdeps)'
     'check:Verify installed repos are intact (dir, binaries, git)'
+    'doctor:Full health check (integrity + source + build + lifecycle)'
     'owns:Show which indexed repo owns a filesystem path'
     'path:Print a repo directory (cd "$(clone path <repo>)")'
     'changelog:Commits landed upstream since the repo was installed'
@@ -116,7 +117,7 @@ _clone() {
             update|up) compadd -- '--no-rebuild' '--ignore' ;;
             info|i) compadd -- '-r' '--remote' ;;
             reason) compadd -- '-e' '--explicit' '--asdeps' ;;
-            check) compadd -- '-a' '--all' '--source' ;;
+            check) compadd -- '-a' '--all' '--source' '--build' ;;
           esac
           ;;
         owns)
@@ -137,7 +138,7 @@ _clone() {
           compadd -- '--remove' '-y' '--yes'
           ;;
         clean)
-          compadd -- '--builds' '--cache' '--duplicates' '--dry-run' '-y' '--yes'
+          compadd -- '--builds' '--source' '--backup' '--cache' '--duplicates' '--dry-run' '-y' '--yes'
           ;;
         log)
           if [[ -f "$db_dir/clone.db" ]]; then
