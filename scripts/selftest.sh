@@ -10,7 +10,16 @@ set -u
 # Resolve the CLI relative to this script so it works anywhere (CI checkout, etc.).
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export CLI="$REPO_DIR/dist/index.js"
-export SBOX="${SBOX:-${TMPDIR:-/tmp}/clone-selftest}"
+# Default to a UNIQUE per-run sandbox so concurrent selftest runs never clobber each other:
+# the `rm -rf "$SBOX"` below wipes the sandbox at startup, so two runs sharing a FIXED path
+# would delete each other's installs/symlinks/worktrees mid-flight → flaky bin-symlink failures.
+# An explicit SBOX= is honored verbatim (and left for inspection); a generated one auto-cleans.
+if [ -n "${SBOX:-}" ]; then
+  export SBOX
+else
+  export SBOX="${TMPDIR:-/tmp}/clone-selftest.$$"
+  trap 'rm -rf "$SBOX"' EXIT
+fi
 export CLONE_ROOT="$SBOX/root"
 export CLONE_BIN="$SBOX/bin"
 export CLONE_DATA="$SBOX/data"
