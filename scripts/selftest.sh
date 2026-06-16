@@ -136,6 +136,28 @@ assert "npm keeps a build worktree (bin needs its package)" test -d "$SBOX/build
 assert "npm source stays pristine (node_modules in worktree)" bash -c '! test -d "$CLONE_ROOT/test/nodetool/node_modules"'
 
 # ════════════════════════════════════════════════════════════════════
+hdr "6b. npm build allows dependency install scripts (npm 11.16 EALLOWSCRIPTS guard)"
+# A repo whose dependency runs a postinstall. Building from source must let it
+# run — even on a machine whose npm config blocks scripts — so clone injects the
+# allow-scripts override at build time. (Regression for npm 11.16's lifecycle
+# script gating + the legacy allow-scripts=* EALLOWSCRIPTS crash.)
+DEPSRC="$SBOX/scripty-dep-src"; mkdir -p "$DEPSRC"
+cat > "$DEPSRC/package.json" <<'PJ'
+{"name":"es-scripty-dep","version":"1.0.0","scripts":{"postinstall":"node -e \"require('fs').writeFileSync(process.env.INIT_CWD+'/.dep-ran','1')\""}}
+PJ
+( cd "$DEPSRC" && npm pack --silent ) >/dev/null 2>&1
+TGZ="$DEPSRC/es-scripty-dep-1.0.0.tgz"
+seed test/needsdep
+DD="$CLONE_ROOT/test/needsdep"
+printf '{"name":"needsdep","version":"1.0.0","bin":{"needsdep":"cli.js"},"dependencies":{"es-scripty-dep":"file:%s"}}\n' "$TGZ" > "$DD/package.json"
+printf '#!/usr/bin/env node\nconsole.log("needsdep ok");\n' > "$DD/cli.js"
+commit "$DD"
+# blocking outer env proves the override is clone's doing, not the machine's
+grepout "npm build completes with a scripted dep" "Installed|added" \
+  bash -c 'npm_config_dangerously_allow_all_scripts=false npm_config_allow_scripts= clone install test/needsdep -y'
+assert "dependency postinstall actually ran during build" bash -c 'find "$SBOX" -name .dep-ran | grep -q .'
+
+# ════════════════════════════════════════════════════════════════════
 hdr "7. build lifecycle — cmake"
 seed test/cmaketool
 D="$CLONE_ROOT/test/cmaketool"

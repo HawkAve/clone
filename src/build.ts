@@ -81,10 +81,22 @@ export function buildRepo(
     ? new Map<string, number>()
     : snapshotExecutables(repoPath, recipe.binHints);
 
+  // Building from source means we've chosen to trust this repo, so its build
+  // steps are allowed to run install scripts. npm 11.16 blocks dependency
+  // lifecycle scripts by default and rejects the legacy `allow-scripts=*` config
+  // form (EALLOWSCRIPTS) on project-scoped installs — so neutralise any ambient
+  // allow-scripts and explicitly allow all scripts for the build. Inert for
+  // non-npm steps (make/cargo/cmake ignore npm_config_*).
+  const buildEnv = {
+    ...process.env,
+    npm_config_allow_scripts: "",
+    npm_config_dangerously_allow_all_scripts: "true",
+  };
+
   for (const step of recipe.steps) {
     opts.onStep?.(step);
     try {
-      execSync(step, { cwd: repoPath, stdio: "inherit" });
+      execSync(step, { cwd: repoPath, stdio: "inherit", env: buildEnv });
     } catch (err) {
       return {
         ok: false,
