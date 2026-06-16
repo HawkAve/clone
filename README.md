@@ -14,9 +14,10 @@ npm install -g @nxac/clone
 # Clone repos
 clone owner/repo
 clone https://github.com/owner/repo.git
+clone garytan/gstack                         # typo? if the repo doesn't exist, suggests the closest matches
 
 # Search & query
-clone search mobile                          # search the local index (like pacman -Qs)
+clone search mobile                          # search the local index; no local match → points you at --remote
 clone search llm --long                      # -l: verbose cards with descriptions + topics
 
 # Search ALL of GitHub (like pacman -Ss)

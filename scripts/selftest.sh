@@ -10,7 +10,16 @@ set -u
 # Resolve the CLI relative to this script so it works anywhere (CI checkout, etc.).
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export CLI="$REPO_DIR/dist/index.js"
-export SBOX="${SBOX:-${TMPDIR:-/tmp}/clone-selftest}"
+# Default to a UNIQUE per-run sandbox so concurrent selftest runs never clobber each other:
+# the `rm -rf "$SBOX"` below wipes the sandbox at startup, so two runs sharing a FIXED path
+# would delete each other's installs/symlinks/worktrees mid-flight → flaky bin-symlink failures.
+# An explicit SBOX= is honored verbatim (and left for inspection); a generated one auto-cleans.
+if [ -n "${SBOX:-}" ]; then
+  export SBOX
+else
+  export SBOX="${TMPDIR:-/tmp}/clone-selftest.$$"
+  trap 'rm -rf "$SBOX"' EXIT
+fi
 export CLONE_ROOT="$SBOX/root"
 export CLONE_BIN="$SBOX/bin"
 export CLONE_DATA="$SBOX/data"
@@ -66,6 +75,8 @@ grepout "info shows repo"   "octocat/Hello-World"   clone info octocat/Hello-Wor
 grepout "list shows repo"   "Hello-World"           clone list
 grepout "stats counts it"   "Total repos:\s*1"      clone stats
 grepout "local search hit"  "Hello-World"           clone search hello
+# empty local search must point at GitHub (--remote), not dead-end on "No repos match"
+grepout "empty local search hints --remote" "Try GitHub.*--remote" clone search zzznomatchxyz
 
 # ════════════════════════════════════════════════════════════════════
 hdr "3. remote search & trending (read-only, network)"
@@ -73,6 +84,13 @@ grepout "remote search"     "repositories"          clone search cli --remote -n
 grepout "remote search paginates past 100" "1[0-9][0-9] repositories" clone search react -r -n 150
 grepout "trending daily"    "trending|repos"        clone trending -n 5
 grepout "missing json"      "daily|\\{"             clone missing daily --json
+
+# ════════════════════════════════════════════════════════════════════
+hdr "3b. typo on a not-found clone → 'did you mean?' (network)"
+# A 1-char owner typo of a hugely-popular repo must surface the real one,
+# on both the clone path and the install path.
+grepout "clone typo suggests the real repo"   "torvalds/linux" clone torvaldds/linux
+grepout "install typo suggests the real repo" "torvalds/linux" clone install torvaldds/linux
 
 # ════════════════════════════════════════════════════════════════════
 hdr "4. build lifecycle — make (cc)"
