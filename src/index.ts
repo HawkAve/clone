@@ -33,6 +33,8 @@ import {
   fetchTrending,
   fetchTrendingDetailed,
   searchRemoteRepos,
+  repoExists,
+  findSimilarRepos,
   fetchIssues,
   fetchIssue,
   fetchIssueComments,
@@ -342,6 +344,39 @@ async function prompt(question: string): Promise<string> {
 
 // --- Commands ---
 
+/**
+ * A clone just failed. If it failed because the repo doesn't exist (a typo),
+ * print a clearer message plus "did you mean?" suggestions and return true so
+ * the caller skips its own generic error. For any other failure (network, auth,
+ * disk — repo exists or we can't tell) return false and let the caller print the
+ * plain "Failed to clone" line.
+ */
+async function suggestOnCloneFailure(ownerRepo: string): Promise<boolean> {
+  const [owner, repo] = ownerRepo.split("/");
+  // Only a definitive 404 means a typo; on exists/unknown, defer to the caller.
+  if ((await repoExists(owner, repo)) !== false) return false;
+
+  console.error(
+    chalk.red(`Failed to clone ${ownerRepo} — no such repo on GitHub.`)
+  );
+  const suggestions = await findSimilarRepos(ownerRepo, 3);
+  if (suggestions.length) {
+    console.error(chalk.bold("Did you mean?"));
+    for (const s of suggestions) {
+      const meta = [
+        s.stars ? `★${formatStars(s.stars)}` : "",
+        s.language && s.language !== "unknown" ? s.language : "",
+      ]
+        .filter(Boolean)
+        .join("  ");
+      console.error(
+        `  ${chalk.cyan("clone " + s.repo)}${meta ? chalk.dim("   " + meta) : ""}`
+      );
+    }
+  }
+  return true;
+}
+
 async function cmdCloneRepo(input: string, cloneOpts: CloneOptions = {}) {
   const ownerRepo = parseGitHubUrl(input);
   if (!ownerRepo) {
@@ -379,7 +414,9 @@ async function cmdCloneRepo(input: string, cloneOpts: CloneOptions = {}) {
     console.log(chalk.green("done"));
     console.log(`${chalk.green("Done:")} ${dest}`);
   } else {
-    console.error(chalk.red(`Failed to clone ${ownerRepo}`));
+    if (!(await suggestOnCloneFailure(ownerRepo))) {
+      console.error(chalk.red(`Failed to clone ${ownerRepo}`));
+    }
     process.exit(1);
   }
 }
@@ -486,6 +523,16 @@ async function cmdSearch(
       console.log();
       results = db.search(query);
     }
+  }
+
+  // Local-only search came up empty. Don't dead-end on "No repos match" — point
+  // the user at GitHub (pacman -Ss), the way they likely expected `search` to
+  // work. Quiet mode stays machine-clean (no hint on stdout) so pipes are safe.
+  if (results.length === 0 && !opts.quiet) {
+    const q = /\s/.test(query) ? `"${query}"` : query;
+    console.log(chalk.yellow("No local matches."));
+    console.log(chalk.dim("Try GitHub:  ") + `clone search ${q} --remote`);
+    return;
   }
 
   if (opts.quiet) {
@@ -1566,7 +1613,9 @@ async function cmdInstall(
       console.log(`${chalk.cyan("Cloning")} ${ownerRepo}...`);
       mkdirSync(join(config.baseDir, owner), { recursive: true });
       if (!gitClone(ownerRepo, dest)) {
-        console.error(chalk.red(`Failed to clone ${ownerRepo}`));
+        if (!(await suggestOnCloneFailure(ownerRepo))) {
+          console.error(chalk.red(`Failed to clone ${ownerRepo}`));
+        }
         process.exit(1);
       }
       db.upsert(await buildEntry(ownerRepo, "manual", dest));

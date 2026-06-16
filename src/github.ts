@@ -154,6 +154,92 @@ export async function searchRemoteRepos(
   return { items, total };
 }
 
+/**
+ * Does `owner/repo` exist on GitHub? Distinguishes a genuine 404 (typo / gone)
+ * from "couldn't tell" so callers only offer "did you mean?" when the repo
+ * really isn't there.
+ *   true  → exists (200)
+ *   false → 404, definitively not found
+ *   null  → unknown (network / rate-limit / auth) — don't guess
+ */
+export async function repoExists(
+  owner: string,
+  repo: string
+): Promise<boolean | null> {
+  try {
+    await getOctokit().rest.repos.get({ owner, repo });
+    return true;
+  } catch (err: any) {
+    if (err?.status === 404) return false;
+    return null;
+  }
+}
+
+// Classic iterative Levenshtein edit distance (small strings: repo/owner names).
+function levenshtein(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, i) => i);
+  let curr = new Array<number>(n + 1).fill(0);
+  for (let i = 1; i <= m; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[n];
+}
+
+/**
+ * Find repos that look like a misspelling of `ownerRepo` — for "did you mean?"
+ * on a not-found clone. Searches GitHub for the repo-name token, then ranks by
+ * total edit distance from what was typed (owner edits + repo edits, via
+ * Levenshtein), with stars as the popularity tie-break. This catches the common
+ * owner typo (garytan→garrytan) as well as small repo-name slips. Candidates
+ * whose repo name is unrelated to what was typed are dropped, so we never
+ * surface noise. Returns at most `limit` suggestions, best first.
+ */
+export async function findSimilarRepos(
+  ownerRepo: string,
+  limit = 3
+): Promise<RemoteRepo[]> {
+  const [typedOwner = "", typedRepo = ""] = ownerRepo.toLowerCase().split("/");
+  if (!typedRepo) return [];
+  try {
+    const { items } = await searchRemoteRepos(typedRepo, {
+      limit: 30,
+      sort: "best-match",
+    });
+    return items
+      .map((it) => {
+        const [o = "", r = ""] = it.repo.toLowerCase().split("/");
+        const repoDist = levenshtein(r, typedRepo);
+        const ownerDist = levenshtein(o, typedOwner);
+        return {
+          it,
+          repoDist,
+          dist: ownerDist + repoDist, // total edits from what was typed
+          related:
+            r === typedRepo || r.includes(typedRepo) || typedRepo.includes(r),
+        };
+      })
+      // keep only plausibly-meant repos: exact/substring name, or ≤2 edits away
+      .filter((s) => s.related || s.repoDist <= 2)
+      // never re-suggest the exact thing the user typed (it doesn't exist)
+      .filter((s) => s.it.repo.toLowerCase() !== ownerRepo.toLowerCase())
+      // closest overall to what they typed, popularity as the tie-break
+      .sort((a, b) => a.dist - b.dist || b.it.stars - a.it.stars)
+      .slice(0, limit)
+      .map((s) => s.it);
+  } catch {
+    return [];
+  }
+}
+
 export async function fetchTrending(
   period: string
 ): Promise<string[]> {

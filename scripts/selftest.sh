@@ -75,6 +75,8 @@ grepout "info shows repo"   "octocat/Hello-World"   clone info octocat/Hello-Wor
 grepout "list shows repo"   "Hello-World"           clone list
 grepout "stats counts it"   "Total repos:\s*1"      clone stats
 grepout "local search hit"  "Hello-World"           clone search hello
+# empty local search must point at GitHub (--remote), not dead-end on "No repos match"
+grepout "empty local search hints --remote" "Try GitHub.*--remote" clone search zzznomatchxyz
 
 # ════════════════════════════════════════════════════════════════════
 hdr "3. remote search & trending (read-only, network)"
@@ -82,6 +84,13 @@ grepout "remote search"     "repositories"          clone search cli --remote -n
 grepout "remote search paginates past 100" "1[0-9][0-9] repositories" clone search react -r -n 150
 grepout "trending daily"    "trending|repos"        clone trending -n 5
 grepout "missing json"      "daily|\\{"             clone missing daily --json
+
+# ════════════════════════════════════════════════════════════════════
+hdr "3b. typo on a not-found clone → 'did you mean?' (network)"
+# A 1-char owner typo of a hugely-popular repo must surface the real one,
+# on both the clone path and the install path.
+grepout "clone typo suggests the real repo"   "torvalds/linux" clone torvaldds/linux
+grepout "install typo suggests the real repo" "torvalds/linux" clone install torvaldds/linux
 
 # ════════════════════════════════════════════════════════════════════
 hdr "4. build lifecycle — make (cc)"
